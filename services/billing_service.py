@@ -1,73 +1,31 @@
-"""Billing service - calculates costs for sessions.
+"""Billing service - flat rate calculation with discounts and overrides.
 
-Business rules:
-- Rate determined by: microscope type x billing tier
-- Discount reduces TIME, not rate
-- Override hierarchy: cost_override > time_override + discount > raw calculation
-- Excluded from billing accounts: cost = 0
-- Cancelled sessions: cost = 0
+Rules:
+- Flat rate: configurable PLN/h (default 150 PLN/h)
+- Discount reduces billable TIME, not rate
+- Per-user discount (global) or per-session discount (PPM override)
+- Per-session override: fixed cost OR fixed time
+- Per-session discount overrides user global discount
+- excluded_from_billing: user has zero cost (vacuum still analyzed)
+- Penalty LEFT_VENTED: 100 PLN per occurrence
 """
 
 import logging
-from typing import List, Optional, Dict
+from typing import Optional
 
-from models.enums import BillingTier, MicroscopeType, SessionStatus
-from models.dataclasses import Session, User, BillingTierConfig, Penalty
+from models.dataclasses import Session, User, Penalty
 
 logger = logging.getLogger(__name__)
 
-# Default rates per microscope type per tier
-DEFAULT_RATES = {
-    MicroscopeType.VEGA3: {
-        BillingTier.PROJECT: 150.0,
-        BillingTier.UJ_UNIT: 150.0,
-        BillingTier.EXTERNAL: 150.0,
-    },
-    MicroscopeType.MIRA3_FEG: {
-        BillingTier.PROJECT: 225.0,
-        BillingTier.UJ_UNIT: 225.0,
-        BillingTier.EXTERNAL: 225.0,
-    },
-}
+DEFAULT_RATE_PLN_PER_HOUR = 150.0
+PENALTY_LEFT_VENTED_PLN = 100.0
 
 
 class BillingService:
-    """Calculates session costs based on rates, tiers, and discounts.
+    """Calculates costs for sessions based on flat rate billing."""
 
-    Cost calculation priority:
-    1. If cancelled -> 0
-    2. If excluded_from_billing (user) -> 0
-    3. If cost_override set -> use it directly
-    4. Otherwise: effective_hours × discount_factor × effective_rate
-    """
-
-    def __init__(self, tier_configs: Optional[List[BillingTierConfig]] = None):
-        """Initialize with optional tier configurations.
-
-        Args:
-            tier_configs: List of BillingTierConfig from database.
-                         If None, uses DEFAULT_RATES.
-        """
-        self._rates: Dict[int, Dict[BillingTier, float]] = {}
-        if tier_configs:
-            for tc in tier_configs:
-                if tc.microscope_id not in self._rates:
-                    self._rates[tc.microscope_id] = {}
-                self._rates[tc.microscope_id][tc.tier] = tc.rate_pln_per_hour
-
-    def get_rate(
-        self, microscope_id: int, microscope_type: MicroscopeType, tier: BillingTier
-    ) -> float:
-        """Get hourly rate for a specific microscope and tier.
-
-        Falls back to default rate for the microscope type if not configured.
-        """
-        if microscope_id in self._rates:
-            if tier in self._rates[microscope_id]:
-                return self._rates[microscope_id][tier]
-
-        # Fallback to defaults
-        return DEFAULT_RATES.get(microscope_type, {}).get(tier, 150.0)
+    def __init__(self, rate_pln_per_hour: float = DEFAULT_RATE_PLN_PER_HOUR):
+        self.rate_pln_per_hour = rate_pln_per_hour
 
     def calculate_session_cost(
         self,
@@ -76,125 +34,116 @@ class BillingService:
     ) -> float:
         """Calculate cost for a single session.
 
+        Priority:
+        1. If excluded_from_billing -> 0.0
+        2. If override_cost is set -> use override_cost directly
+        3. If override_time_minutes is set -> rate * override_time
+        4. Otherwise -> rate * (gvl_total_seconds * (1 - discount%))
+
+        Discount priority:
+        - session.discount_percent > 0 -> use session discount
+        - user.discount_percent > 0 -> use user discount
+        - else -> 0%
+
         Args:
-            session: Session to calculate cost for.
-            user: Optional User object for global discount and billing exclusion.
+            session: The session to calculate cost for.
+            user: Optional user for global discount lookup.
 
         Returns:
             Calculated cost in PLN.
         """
-        # Cancelled = free
-        if session.cancelled or session.status == SessionStatus.CANCELLED:
+        # Check exclusion
+        if session.excluded_from_billing:
             return 0.0
-
-        # User excluded from billing
         if user and user.excluded_from_billing:
             return 0.0
 
-        # Cost override takes priority
-        if session.cost_override is not None:
-            return session.cost_override
+        # Check override cost (fixed amount)
+        if session.override_cost is not None:
+            return session.override_cost
 
-        # Determine effective rate
-        effective_rate = session.effective_rate
-        if effective_rate == session.hourly_rate and session.rate_override is None:
-            # No rate override on session, use tier config
-            effective_rate = self.get_rate(
-                session.microscope_id, session.microscope_type, session.billing_tier
+        # Determine effective discount
+        discount_percent = self._get_effective_discount(session, user)
+
+        # Determine billable seconds
+        if session.override_time_minutes is not None:
+            billable_seconds = session.override_time_minutes * 60.0
+        else:
+            # Apply discount to GVL total time
+            billable_seconds = session.gvl_total_seconds * (
+                1.0 - discount_percent / 100.0
             )
 
-        # Determine effective duration
-        if session.time_override_minutes is not None:
-            effective_hours = session.time_override_minutes / 60.0
-        else:
-            effective_hours = session.duration_seconds / 3600.0
+        # Ensure non-negative
+        billable_seconds = max(billable_seconds, 0.0)
 
-        # Apply discount (reduces time, not rate)
-        discount_percent = session.discount_percent
-        if discount_percent == 0.0 and user and user.discount_percent > 0:
-            discount_percent = user.discount_percent
+        # Calculate cost: rate per hour * hours
+        billable_hours = billable_seconds / 3600.0
+        cost = billable_hours * self.rate_pln_per_hour
 
-        discount_factor = 1.0 - (discount_percent / 100.0)
-        billable_hours = effective_hours * discount_factor
+        return round(cost, 2)
 
-        cost = round(billable_hours * effective_rate, 2)
-        return max(cost, 0.0)
+    def _get_effective_discount(
+        self, session: Session, user: Optional[User]
+    ) -> float:
+        """Get effective discount - session override takes priority over user global."""
+        if session.discount_percent > 0:
+            return session.discount_percent
+        if user and user.discount_percent > 0:
+            return user.discount_percent
+        return 0.0
 
-    def calculate_batch(
+    def calculate_penalty_cost(self, penalty: Penalty) -> float:
+        """Calculate penalty cost (always 100 PLN for LEFT_VENTED)."""
+        if penalty.penalty_type == "LEFT_VENTED":
+            return PENALTY_LEFT_VENTED_PLN
+        return penalty.amount_pln
+
+    def calculate_total_for_user(
         self,
-        sessions: List[Session],
-        users: Optional[Dict[str, User]] = None,
-    ) -> List[Session]:
-        """Calculate costs for a batch of sessions.
-
-        Updates each session's calculated_cost field in place.
-
-        Args:
-            sessions: List of sessions to process.
-            users: Optional dict of username -> User for discount lookup.
-
-        Returns:
-            Same list with calculated_cost updated.
-        """
-        users = users or {}
-
-        for session in sessions:
-            user = users.get(session.username)
-            session.calculated_cost = self.calculate_session_cost(session, user)
-
-        return sessions
-
-    def get_summary(
-        self,
-        sessions: List[Session],
-        penalties: Optional[List[Penalty]] = None,
+        sessions: list,
+        penalties: list,
+        user: Optional[User] = None,
     ) -> dict:
-        """Generate billing summary.
+        """Calculate total billing summary for a user.
 
         Returns:
-            Dict with total_cost, total_hours, session_count,
-            penalties_total, breakdown by user, breakdown by tier.
+            Dictionary with total_cost, total_penalties, total_billable_hours,
+            session_count, measurement_count.
         """
-        penalties = penalties or []
-
         total_cost = 0.0
-        total_hours = 0.0
-        by_user: Dict[str, dict] = {}
-        by_tier: Dict[str, dict] = {}
+        total_penalties = 0.0
+        total_billable_seconds = 0.0
+        measurement_count = 0
 
         for session in sessions:
-            if session.cancelled or session.excluded_from_invoice:
-                continue
-
-            cost = session.effective_cost
-            hours = session.effective_duration_seconds / 3600.0
+            cost = self.calculate_session_cost(session, user)
             total_cost += cost
-            total_hours += hours
 
-            # By user
-            if session.username not in by_user:
-                by_user[session.username] = {"cost": 0.0, "hours": 0.0, "sessions": 0}
-            by_user[session.username]["cost"] += cost
-            by_user[session.username]["hours"] += hours
-            by_user[session.username]["sessions"] += 1
+            if session.gvl_total_seconds > 0:
+                measurement_count += 1
+                if session.override_time_minutes is not None:
+                    total_billable_seconds += session.override_time_minutes * 60.0
+                else:
+                    discount = self._get_effective_discount(session, user)
+                    effective = session.gvl_total_seconds * (1.0 - discount / 100.0)
+                    total_billable_seconds += max(effective, 0.0)
 
-            # By tier
-            tier_name = session.billing_tier.value
-            if tier_name not in by_tier:
-                by_tier[tier_name] = {"cost": 0.0, "hours": 0.0, "sessions": 0}
-            by_tier[tier_name]["cost"] += cost
-            by_tier[tier_name]["hours"] += hours
-            by_tier[tier_name]["sessions"] += 1
-
-        penalties_total = sum(p.amount for p in penalties)
+        for penalty in penalties:
+            total_penalties += self.calculate_penalty_cost(penalty)
 
         return {
             "total_cost": round(total_cost, 2),
-            "total_hours": round(total_hours, 2),
-            "session_count": len([s for s in sessions if not s.cancelled]),
-            "penalties_total": round(penalties_total, 2),
-            "penalties_count": len(penalties),
-            "grand_total": round(total_cost + penalties_total, 2),
-            "by_user": by_user,
-            "by_tier": by_tier,
+            "total_penalties": round(total_penalties, 2),
+            "grand_total": round(total_cost + total_penalties, 2),
+            "total_billable_hours": round(total_billable_seconds / 3600.0, 2),
+            "session_count": len(sessions),
+            "measurement_count": measurement_count,
         }
+
+    def update_rate(self, new_rate: float) -> None:
+        """Update the billing rate."""
+        if new_rate <= 0:
+            raise ValueError("Rate must be positive")
+        self.rate_pln_per_hour = new_rate
+        logger.info("Billing rate updated to %.2f PLN/h", new_rate)

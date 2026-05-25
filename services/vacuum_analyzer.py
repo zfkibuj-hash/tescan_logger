@@ -1,246 +1,265 @@
-"""Vacuum cycle analyzer - processes vacuum events into cycles with penalties.
+"""Vacuum cycle analyzer with state machine and anomaly detection.
 
-Business rules:
-- PUMP -> READY = OK
-- PUMP -> VENT = ABORTED
-- PUMP -> OFF = ABORTED
-- VENT -> OFF = LEFT_VENTED -> penalty 100 PLN
+Vacuum state machine:
+  PUMP -> READY    = OK
+  PUMP -> VENT     = ABORTED
+  PUMP -> OFF      = ABORTED
+  VENT -> OFF      = LEFT_VENTED -> penalty 100 PLN
 
 Anomaly detection:
-- LONG_PUMP_TIME: ready_time exceeds threshold (possible contamination / outgassing)
-- IDLE_AFTER_READY: long gap between READY and HV ON/GVL open (microscope unused)
+  LONG_PUMP_TIME   - pumping takes > threshold (default 5 min)
+  IDLE_AFTER_READY - long wait READY -> GVL open (default > 30 min)
 """
 
 import logging
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from models.enums import EventType, VacuumStatus, AnomalyType
 from models.dataclasses import ParsedEvent, VacuumCycle, Penalty, Anomaly
 
 logger = logging.getLogger(__name__)
 
-PENALTY_AMOUNT = 100.0  # PLN
-
-# Anomaly thresholds (configurable later via settings)
-LONG_PUMP_THRESHOLD_SECONDS = 300.0  # >5 min pump time = suspicious
-IDLE_AFTER_READY_THRESHOLD_SECONDS = 1800.0  # >30 min idle after ready = flagged
+# Default thresholds (in seconds)
+DEFAULT_PUMP_WARNING_SECONDS = 300    # 5 minutes
+DEFAULT_PUMP_CRITICAL_SECONDS = 600   # 10 minutes
+DEFAULT_IDLE_THRESHOLD_SECONDS = 1800  # 30 minutes
 
 
 class VacuumAnalyzer:
-    """Analyzes vacuum events and builds VacuumCycle + Penalty objects.
+    """Analyzes vacuum cycles and detects anomalies."""
 
-    Tracks state machine:
-    - PUMP starts a cycle
-    - READY completes it successfully (OK)
-    - VENT or OFF during pumping = ABORTED
-    - VENT followed by OFF = LEFT_VENTED (penalty)
-    """
+    def __init__(
+        self,
+        pump_warning_seconds: float = DEFAULT_PUMP_WARNING_SECONDS,
+        pump_critical_seconds: float = DEFAULT_PUMP_CRITICAL_SECONDS,
+        idle_threshold_seconds: float = DEFAULT_IDLE_THRESHOLD_SECONDS,
+    ):
+        self.pump_warning_seconds = pump_warning_seconds
+        self.pump_critical_seconds = pump_critical_seconds
+        self.idle_threshold_seconds = idle_threshold_seconds
 
-    def __init__(self, microscope_id: int = 0,
-                 long_pump_threshold: float = LONG_PUMP_THRESHOLD_SECONDS,
-                 idle_threshold: float = IDLE_AFTER_READY_THRESHOLD_SECONDS):
-        self.microscope_id = microscope_id
-        self.long_pump_threshold = long_pump_threshold
-        self.idle_threshold = idle_threshold
+        self._current_cycle: Optional[VacuumCycle] = None
+        self._last_ready_time: Optional[datetime] = None
+        self._vented: bool = False
 
-    def analyze(
-        self, events: List[ParsedEvent], source_file: str = ""
-    ) -> Tuple[List[VacuumCycle], List[Penalty], List[Anomaly]]:
-        """Analyze vacuum events and produce cycles + penalties + anomalies.
+    def analyze_events(
+        self,
+        events: List[ParsedEvent],
+        session_id: Optional[int] = None,
+        source_file: str = "",
+    ) -> dict:
+        """Analyze vacuum-related events and produce cycles, penalties, anomalies.
 
         Args:
-            events: All parsed events (filtered to vacuum-related internally).
-            source_file: Source file for reference.
+            events: List of parsed events (all types, filtered internally).
+            session_id: Optional session ID to associate with cycles.
+            source_file: Source file path.
 
         Returns:
-            Tuple of (vacuum_cycles, penalties, anomalies).
+            Dictionary with keys: cycles, penalties, anomalies.
         """
         cycles: List[VacuumCycle] = []
         penalties: List[Penalty] = []
         anomalies: List[Anomaly] = []
 
-        current_user: Optional[str] = None
-        current_session_id: Optional[int] = None
-
-        # State tracking
-        pump_start: Optional[datetime] = None
-        vent_start: Optional[datetime] = None
-        vacuum_ready_time: Optional[datetime] = None  # When READY was achieved
-        is_pumping: bool = False
-        is_venting: bool = False
+        self._current_cycle = None
+        self._last_ready_time = None
+        self._vented = False
 
         for event in events:
-            # Track current user
-            if event.event_type == EventType.SESSION_START:
-                current_user = event.username
-            elif event.event_type == EventType.SESSION_END:
-                current_user = None
+            result = self._process_event(event, session_id, source_file)
+            if result:
+                if result.get("cycle"):
+                    cycles.append(result["cycle"])
+                if result.get("penalty"):
+                    penalties.append(result["penalty"])
+                if result.get("anomaly"):
+                    anomalies.append(result["anomaly"])
 
-            # ANOMALY: Idle after ready - user started measurement long after vacuum ready
-            elif event.event_type in (EventType.HV_ON, EventType.GVL_OPEN):
-                if vacuum_ready_time is not None:
-                    idle_gap = (event.timestamp - vacuum_ready_time).total_seconds()
-                    if idle_gap > self.idle_threshold:
-                        anomalies.append(Anomaly(
-                            microscope_id=self.microscope_id,
-                            session_id=current_session_id,
-                            anomaly_type=AnomalyType.IDLE_AFTER_READY,
-                            severity="info" if idle_gap < 7200 else "warning",
-                            timestamp=event.timestamp,
-                            description=(
-                                f"Long idle after vacuum ready: {idle_gap/60:.0f} min "
-                                f"(ready at {vacuum_ready_time.strftime('%H:%M')}, "
-                                f"measurement started at {event.timestamp.strftime('%H:%M')}). "
-                                f"User: {current_user}."
-                            ),
-                            value=idle_gap,
-                            threshold=self.idle_threshold,
-                            source_file=source_file,
-                        ))
-                        logger.info(
-                            "IDLE_AFTER_READY: %.0f min for user=%s at %s",
-                            idle_gap / 60, current_user, event.timestamp
-                        )
-                vacuum_ready_time = None  # Reset after measurement starts
+        # Check for idle after last ready (if GVL_OPEN comes later)
+        # This is handled in _process_gvl_open
 
-            # Vacuum state machine
-            elif event.event_type == EventType.VACUUM_PUMP:
-                # Start new pump cycle
-                pump_start = event.timestamp
-                is_pumping = True
-                is_venting = False
-
-            elif event.event_type == EventType.VACUUM_READY:
-                # PUMP -> READY = OK
-                if is_pumping and pump_start is not None:
-                    ready_seconds = None
-                    if event.details:
-                        try:
-                            ready_seconds = float(event.details)
-                        except ValueError:
-                            pass
-
-                    duration = (event.timestamp - pump_start).total_seconds()
-                    cycle = VacuumCycle(
-                        microscope_id=self.microscope_id,
-                        session_id=current_session_id,
-                        username=current_user,
-                        command="PUMP",
-                        start_time=pump_start,
-                        end_time=event.timestamp,
-                        duration_seconds=duration,
-                        status=VacuumStatus.OK,
-                        ready_time_seconds=ready_seconds,
-                        source_file=source_file,
-                    )
-                    cycles.append(cycle)
-
-                    # ANOMALY: Long pump time (possible contamination/outgassing)
-                    effective_ready = ready_seconds if ready_seconds else duration
-                    if effective_ready > self.long_pump_threshold:
-                        anomalies.append(Anomaly(
-                            microscope_id=self.microscope_id,
-                            session_id=current_session_id,
-                            anomaly_type=AnomalyType.LONG_PUMP_TIME,
-                            severity="warning" if effective_ready < 600 else "critical",
-                            timestamp=event.timestamp,
-                            description=(
-                                f"Long pump time: {effective_ready:.0f}s "
-                                f"(threshold: {self.long_pump_threshold:.0f}s). "
-                                f"User: {current_user}. "
-                                f"Possible sample contamination or outgassing."
-                            ),
-                            value=effective_ready,
-                            threshold=self.long_pump_threshold,
-                            source_file=source_file,
-                        ))
-                        logger.warning(
-                            "LONG_PUMP_TIME: %.0fs for user=%s at %s",
-                            effective_ready, current_user, event.timestamp
-                        )
-
-                is_pumping = False
-                pump_start = None
-                vacuum_ready_time = event.timestamp  # Track when vacuum became ready
-
-            elif event.event_type == EventType.VACUUM_VENT:
-                if is_pumping and pump_start is not None:
-                    # PUMP -> VENT = ABORTED
-                    duration = (event.timestamp - pump_start).total_seconds()
-                    cycle = VacuumCycle(
-                        microscope_id=self.microscope_id,
-                        session_id=current_session_id,
-                        username=current_user,
-                        command="PUMP",
-                        start_time=pump_start,
-                        end_time=event.timestamp,
-                        duration_seconds=duration,
-                        status=VacuumStatus.ABORTED,
-                        source_file=source_file,
-                    )
-                    cycles.append(cycle)
-                    is_pumping = False
-                    pump_start = None
-
-                # Start VENT tracking
-                vent_start = event.timestamp
-                is_venting = True
-
-            elif event.event_type == EventType.VACUUM_OFF:
-                if is_pumping and pump_start is not None:
-                    # PUMP -> OFF = ABORTED
-                    duration = (event.timestamp - pump_start).total_seconds()
-                    cycle = VacuumCycle(
-                        microscope_id=self.microscope_id,
-                        session_id=current_session_id,
-                        username=current_user,
-                        command="PUMP",
-                        start_time=pump_start,
-                        end_time=event.timestamp,
-                        duration_seconds=duration,
-                        status=VacuumStatus.ABORTED,
-                        source_file=source_file,
-                    )
-                    cycles.append(cycle)
-                    is_pumping = False
-                    pump_start = None
-
-                elif is_venting and vent_start is not None:
-                    # VENT -> OFF = LEFT_VENTED -> penalty!
-                    duration = (event.timestamp - vent_start).total_seconds()
-                    cycle = VacuumCycle(
-                        microscope_id=self.microscope_id,
-                        session_id=current_session_id,
-                        username=current_user,
-                        command="VENT",
-                        start_time=vent_start,
-                        end_time=event.timestamp,
-                        duration_seconds=duration,
-                        status=VacuumStatus.LEFT_VENTED,
-                        source_file=source_file,
-                    )
-                    cycles.append(cycle)
-
-                    # Create penalty
-                    penalty = Penalty(
-                        microscope_id=self.microscope_id,
-                        username=current_user or "UNKNOWN",
-                        amount=PENALTY_AMOUNT,
-                        reason="LEFT_VENTED",
-                        timestamp=event.timestamp,
-                    )
-                    penalties.append(penalty)
-                    logger.warning(
-                        "LEFT_VENTED penalty: user=%s at %s",
-                        current_user, event.timestamp
-                    )
-
-                is_venting = False
-                vent_start = None
+        # Finalize unclosed cycle
+        if self._current_cycle is not None:
+            self._current_cycle.status = VacuumStatus.IN_PROGRESS
+            cycles.append(self._current_cycle)
+            self._current_cycle = None
 
         logger.info(
-            "Vacuum analysis: %d cycles, %d penalties, %d anomalies from %s",
-            len(cycles), len(penalties), len(anomalies), source_file
+            "Vacuum analysis: %d cycles, %d penalties, %d anomalies",
+            len(cycles), len(penalties), len(anomalies),
         )
-        return cycles, penalties, anomalies
+        return {
+            "cycles": cycles,
+            "penalties": penalties,
+            "anomalies": anomalies,
+        }
+
+    def _process_event(
+        self,
+        event: ParsedEvent,
+        session_id: Optional[int],
+        source_file: str,
+    ) -> Optional[dict]:
+        """Process a single event through the vacuum state machine."""
+        if event.event_type == EventType.PUMP:
+            return self._handle_pump(event, session_id, source_file)
+        elif event.event_type == EventType.VAC_READY:
+            return self._handle_ready(event, session_id, source_file)
+        elif event.event_type == EventType.VENT:
+            return self._handle_vent(event, session_id, source_file)
+        elif event.event_type == EventType.VAC_OFF:
+            return self._handle_off(event, session_id, source_file)
+        elif event.event_type == EventType.GVL_OPEN:
+            return self._handle_gvl_open(event, session_id, source_file)
+        return None
+
+    def _handle_pump(
+        self, event: ParsedEvent, session_id: Optional[int], source_file: str
+    ) -> Optional[dict]:
+        """Handle PUMP command - start of vacuum cycle."""
+        result = {}
+
+        # If there was a VENT before this PUMP without OFF, it might
+        # just be a new cycle starting
+        if self._current_cycle is not None:
+            # Previous cycle ends as ABORTED (new pump started)
+            self._current_cycle.status = VacuumStatus.ABORTED
+            self._current_cycle.end_time = event.timestamp
+            result["cycle"] = self._current_cycle
+
+        self._current_cycle = VacuumCycle(
+            session_id=session_id,
+            pump_start=event.timestamp,
+            source_file=source_file,
+        )
+        self._vented = False
+        self._last_ready_time = None
+
+        return result if result else None
+
+    def _handle_ready(
+        self, event: ParsedEvent, session_id: Optional[int], source_file: str
+    ) -> Optional[dict]:
+        """Handle vacuum READY - pumping complete."""
+        result = {}
+
+        if self._current_cycle is None:
+            # Ready without pump - create a minimal cycle
+            self._current_cycle = VacuumCycle(
+                session_id=session_id,
+                pump_start=event.timestamp,
+                source_file=source_file,
+            )
+
+        self._current_cycle.ready_time = event.timestamp
+        self._last_ready_time = event.timestamp
+
+        # Calculate pump duration and check for LONG_PUMP_TIME
+        if self._current_cycle.pump_start:
+            delta = event.timestamp - self._current_cycle.pump_start
+            pump_seconds = delta.total_seconds()
+            self._current_cycle.pump_duration_seconds = pump_seconds
+
+            if pump_seconds > self.pump_warning_seconds:
+                severity = "critical" if pump_seconds >= self.pump_critical_seconds else "warning"
+                anomaly = Anomaly(
+                    anomaly_type=AnomalyType.LONG_PUMP_TIME,
+                    session_id=session_id,
+                    timestamp=event.timestamp,
+                    duration_seconds=pump_seconds,
+                    severity=severity,
+                    description=(
+                        f"Pump time {pump_seconds:.0f}s "
+                        f"exceeds threshold {self.pump_warning_seconds:.0f}s"
+                    ),
+                    source_file=source_file,
+                )
+                result["anomaly"] = anomaly
+
+        return result if result else None
+
+    def _handle_vent(
+        self, event: ParsedEvent, session_id: Optional[int], source_file: str
+    ) -> Optional[dict]:
+        """Handle VENT command."""
+        result = {}
+        self._vented = True
+
+        if self._current_cycle is not None:
+            # PUMP -> VENT = ABORTED
+            self._current_cycle.status = VacuumStatus.ABORTED
+            self._current_cycle.end_time = event.timestamp
+            if self._current_cycle.pump_start:
+                delta = event.timestamp - self._current_cycle.pump_start
+                self._current_cycle.pump_duration_seconds = delta.total_seconds()
+            result["cycle"] = self._current_cycle
+            self._current_cycle = None
+
+        return result if result else None
+
+    def _handle_off(
+        self, event: ParsedEvent, session_id: Optional[int], source_file: str
+    ) -> Optional[dict]:
+        """Handle OFF command."""
+        result = {}
+
+        if self._vented:
+            # VENT -> OFF = LEFT_VENTED -> penalty
+            penalty = Penalty(
+                session_id=session_id,
+                penalty_type="LEFT_VENTED",
+                amount_pln=100.0,
+                timestamp=event.timestamp,
+                source_file=source_file,
+            )
+            result["penalty"] = penalty
+            self._vented = False
+        elif self._current_cycle is not None:
+            # PUMP -> OFF = ABORTED
+            self._current_cycle.status = VacuumStatus.ABORTED
+            self._current_cycle.end_time = event.timestamp
+            if self._current_cycle.pump_start:
+                delta = event.timestamp - self._current_cycle.pump_start
+                self._current_cycle.pump_duration_seconds = delta.total_seconds()
+            result["cycle"] = self._current_cycle
+            self._current_cycle = None
+
+        return result if result else None
+
+    def _handle_gvl_open(
+        self, event: ParsedEvent, session_id: Optional[int], source_file: str
+    ) -> Optional[dict]:
+        """Handle GVL open - check for IDLE_AFTER_READY anomaly."""
+        result = {}
+
+        if self._last_ready_time is not None:
+            delta = event.timestamp - self._last_ready_time
+            idle_seconds = delta.total_seconds()
+
+            if idle_seconds > self.idle_threshold_seconds:
+                anomaly = Anomaly(
+                    anomaly_type=AnomalyType.IDLE_AFTER_READY,
+                    session_id=session_id,
+                    timestamp=event.timestamp,
+                    duration_seconds=idle_seconds,
+                    severity="warning",
+                    description=(
+                        f"Idle {idle_seconds:.0f}s after vacuum ready "
+                        f"(threshold: {self.idle_threshold_seconds:.0f}s)"
+                    ),
+                    source_file=source_file,
+                )
+                result["anomaly"] = anomaly
+
+            self._last_ready_time = None
+
+        # Finalize current cycle as OK (PUMP -> READY -> GVL open)
+        if self._current_cycle is not None:
+            self._current_cycle.status = VacuumStatus.OK
+            self._current_cycle.end_time = event.timestamp
+            result["cycle"] = self._current_cycle
+            self._current_cycle = None
+
+        return result if result else None

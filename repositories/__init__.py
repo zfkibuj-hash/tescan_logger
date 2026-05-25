@@ -1,6 +1,25 @@
-"""Repositories package for TESCAN Log Analyzer."""
+"""Repository layer for TESCAN VEGA3 Log Analyzer."""
+
 from repositories.repositories import (
-    SessionRepository, VacuumRepository, UserRepository,
-    MicroscopeRepository, AuditRepository
+    SessionRepository,
+    VacuumRepository,
+    UserRepository,
+    HVRepository,
+    AuditRepository,
+    FileRepository,
+    SettingsRepository,
+    PenaltyRepository,
+    AnomalyRepository,
 )
-from repositories.hv_repository import HVRepository
+
+__all__ = [
+    "SessionRepository",
+    "VacuumRepository",
+    "UserRepository",
+    "HVRepository",
+    "AuditRepository",
+    "FileRepository",
+    "SettingsRepository",
+    "PenaltyRepository",
+    "AnomalyRepository",
+]

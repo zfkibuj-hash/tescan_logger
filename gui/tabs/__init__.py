@@ -1,1 +1,0 @@
-"""GUI tabs package."""

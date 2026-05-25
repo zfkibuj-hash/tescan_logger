@@ -1,324 +1,229 @@
-"""Import service - orchestrates the full import pipeline.
+"""Import service - file import pipeline and deletion.
 
-Pipeline: scan files -> check cache -> parse -> build sessions ->
-analyze vacuum -> calculate costs -> persist to DB.
+Handles: import of history/HV files, incremental import (hash dedup),
+file deletion (removes ALL related data), audit logging.
 """
 
+import hashlib
+import os
 import logging
-from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
+import re
+from typing import List, Optional
 
-from models.enums import FileType, MicroscopeType
-from models.dataclasses import Session, VacuumCycle, Penalty
+from database.db_manager import DatabaseManager
 from parser.log_parser import HistoryLogParser
 from parser.hv_parser import HVLogParser
-from parser.file_registry import FileRegistry
 from services.session_builder import SessionBuilder
 from services.vacuum_analyzer import VacuumAnalyzer
 from services.billing_service import BillingService
+from models.enums import FileType, AuditAction
 
 logger = logging.getLogger(__name__)
 
-
-
-@dataclass
-class ImportResult:
-    """Result of an import operation."""
-    files_processed: int = 0
-    files_skipped: int = 0
-    sessions_created: int = 0
-    vacuum_cycles_created: int = 0
-    penalties_created: int = 0
-    hv_samples_imported: int = 0
-    errors: List[dict] = None
-
-    def __post_init__(self):
-        if self.errors is None:
-            self.errors = []
+HISTORY_PATTERN = re.compile(r"[Hh]istory.*\.log$", re.IGNORECASE)
+HV_PATTERN = re.compile(r"hv.*\.log$", re.IGNORECASE)
 
 
 class ImportService:
-    """Orchestrates the full import pipeline.
+    """Manages file import pipeline and deletion."""
 
-    Steps:
-    1. Scan/filter files
-    2. Check file_cache (skip already imported)
-    3. Parse History files -> events
-    4. Build sessions from events
-    5. Analyze vacuum cycles
-    6. Calculate billing costs
-    7. Persist everything to database
-    """
-
-    def __init__(self, db_manager=None, microscope_id: int = 0,
-                 microscope_type: MicroscopeType = MicroscopeType.VEGA3):
-        self.db = db_manager
-        self.microscope_id = microscope_id
-        self.microscope_type = microscope_type
-        self.file_registry = FileRegistry()
+    def __init__(self, db: DatabaseManager):
+        self.db = db
         self.history_parser = HistoryLogParser()
         self.hv_parser = HVLogParser()
-        self.session_builder = SessionBuilder(microscope_type, microscope_id)
-        self.vacuum_analyzer = VacuumAnalyzer(microscope_id)
-        self.billing_service = BillingService()
+        self.session_builder = SessionBuilder()
 
+    def detect_file_type(self, file_path: str) -> Optional[FileType]:
+        """Auto-detect file type from filename."""
+        basename = os.path.basename(file_path)
+        if HISTORY_PATTERN.search(basename):
+            return FileType.HISTORY
+        if HV_PATTERN.search(basename):
+            return FileType.HV
+        return None
 
-    def is_file_cached(self, file_path: str) -> bool:
-        """Check if file was already imported (by hash)."""
-        if self.db is None:
-            return False
-        file_hash = FileRegistry.compute_file_hash(file_path)
-        row = self.db.conn.execute(
-            "SELECT id FROM file_cache WHERE file_hash = ?",
-            (file_hash,)
-        ).fetchone()
-        return row is not None
+    def compute_file_hash(self, file_path: str) -> str:
+        """Compute SHA-256 hash of file content."""
+        hasher = hashlib.sha256()
+        try:
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+        except OSError as e:
+            logger.error("Failed to hash file %s: %s", file_path, e)
+            return ""
+        return hasher.hexdigest()
 
-    def cache_file(self, file_path: str, file_type: str,
-                   record_count: int) -> None:
-        """Mark file as imported in cache."""
-        if self.db is None:
-            return
-        import os
-        file_hash = FileRegistry.compute_file_hash(file_path)
-        file_size = os.path.getsize(file_path)
-        self.db.conn.execute(
-            """INSERT OR REPLACE INTO file_cache
-               (file_path, file_hash, file_size, file_type, record_count)
-               VALUES (?, ?, ?, ?, ?)""",
-            (file_path, file_hash, file_size, file_type, record_count)
-        )
-        self.db.conn.commit()
+    def is_already_imported(self, file_hash: str) -> bool:
+        """Check if file with given hash was already imported."""
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT id FROM file_cache WHERE file_hash = ?", (file_hash,))
+            return cursor.fetchone() is not None
 
+    def import_file(self, file_path: str, operator: str = "system") -> dict:
+        """Import a single file (history or HV). Returns dict with status/message."""
+        file_type = self.detect_file_type(file_path)
+        if file_type is None:
+            return {"status": "error", "message": f"Cannot detect file type: {file_path}", "record_count": 0}
+        if not os.path.isfile(file_path):
+            return {"status": "error", "message": f"File not found: {file_path}", "record_count": 0}
+        file_hash = self.compute_file_hash(file_path)
+        if not file_hash:
+            return {"status": "error", "message": "Failed to compute file hash", "record_count": 0}
+        if self.is_already_imported(file_hash):
+            return {"status": "skipped", "message": "File already imported (hash match)", "record_count": 0}
+        if file_type == FileType.HISTORY:
+            return self._import_history(file_path, file_hash, operator)
+        return self._import_hv(file_path, file_hash, operator)
 
-    def import_history_file(self, file_path: str) -> Tuple[
-        List[Session], List[VacuumCycle], List[Penalty]
-    ]:
-        """Import a single History log file.
-
-        Returns:
-            Tuple of (sessions, vacuum_cycles, penalties).
-        """
-        # Parse events
+    def _import_history(self, file_path: str, file_hash: str, operator: str) -> dict:
+        """Import a history log file."""
         events = self.history_parser.parse_file(file_path)
         if not events:
-            return [], [], []
-
-        # Auto-detect microscope type if needed
-        detected_type = self.history_parser.detect_microscope_type(events)
-        if detected_type != self.microscope_type:
-            logger.info(
-                "Detected type %s differs from configured %s for %s",
-                detected_type.value, self.microscope_type.value, file_path
-            )
-
-        # Build sessions
-        builder = SessionBuilder(detected_type, self.microscope_id)
-        sessions = builder.build_sessions(events, file_path)
-
-        # Analyze vacuum
-        cycles, penalties, anomalies = self.vacuum_analyzer.analyze(events, file_path)
-
-        # Calculate costs
-        self.billing_service.calculate_batch(sessions)
-
-        return sessions, cycles, penalties
-
-
-    def import_files(self, file_paths: List[Tuple[str, FileType]]) -> ImportResult:
-        """Import multiple files (History and/or HV).
-
-        Args:
-            file_paths: List of (path, FileType) tuples.
-
-        Returns:
-            ImportResult with counts and errors.
-        """
-        result = ImportResult()
-
-        for file_path, file_type in file_paths:
-            # Skip cached files
-            if self.is_file_cached(file_path):
-                result.files_skipped += 1
-                continue
-
-            try:
-                if file_type == FileType.HISTORY:
-                    sessions, cycles, penalties = self.import_history_file(
-                        file_path
-                    )
-                    result.sessions_created += len(sessions)
-                    result.vacuum_cycles_created += len(cycles)
-                    result.penalties_created += len(penalties)
-
-                    # Persist if DB available
-                    if self.db:
-                        self._persist_sessions(sessions)
-                        self._persist_vacuum(cycles, penalties)
-                        record_count = len(sessions) + len(cycles)
-                        self.cache_file(
-                            file_path, "HISTORY", record_count
-                        )
-
-                elif file_type == FileType.HV:
-                    count = self._import_hv_file(file_path)
-                    result.hv_samples_imported += count
-                    if self.db:
-                        self.cache_file(file_path, "HV", count)
-
-                result.files_processed += 1
-
-            except Exception as e:
-                logger.error("Error importing %s: %s", file_path, e)
-                result.errors.append({
-                    "file_path": file_path,
-                    "error": str(e),
-                })
-
-        # Collect parser errors
-        result.errors.extend(self.history_parser.get_errors())
-        result.errors.extend(self.hv_parser.get_errors())
-
-        logger.info(
-            "Import complete: %d processed, %d skipped, %d sessions",
-            result.files_processed, result.files_skipped,
-            result.sessions_created
-        )
-        return result
-
-
-    def _import_hv_file(self, file_path: str) -> int:
-        """Import HV log file into HV database.
-
-        Returns number of samples imported.
-        """
-        if self.db is None:
-            return 0
-
-        count = 0
-        batch = []
-        BATCH_SIZE = 1000
-
-        for sample in self.hv_parser.parse_file_generator(
-            file_path, self.microscope_id
-        ):
-            batch.append((
-                sample.microscope_id,
-                sample.timestamp.isoformat() if sample.timestamp else None,
-                file_path,
-                sample.set_hv_kv,
-                sample.actual_hv_kv,
-                sample.emission_current_ua,
-                sample.filament_current_a,
-                sample.gun_pressure_pa,
-                sample.chamber_pressure_pa,
-                sample.heating_percent,
-                sample.gun_valve_state,
-                sample.extractor_voltage_kv,
-                sample.suppressor_voltage_v,
-                sample.total_current_ua,
-                sample.flags_hex,
-                sample.column_ion_pump_pressure_pa,
-            ))
-            count += 1
-
-            if len(batch) >= BATCH_SIZE:
-                self._insert_hv_batch(batch)
-                batch.clear()
-
-        if batch:
-            self._insert_hv_batch(batch)
-
-        self.db.hv_conn.commit()
-        logger.info("Imported %d HV samples from %s", count, file_path)
-        return count
-
-    def _insert_hv_batch(self, batch: list) -> None:
-        """Insert batch of HV samples into HV database."""
-        self.db.hv_conn.executemany(
-            """INSERT INTO hv_samples
-               (microscope_id, timestamp, source_file,
-                set_hv_kv, actual_hv_kv, emission_current_ua,
-                filament_current_a, gun_pressure_pa, chamber_pressure_pa,
-                heating_percent, gun_valve_state, extractor_voltage_kv,
-                suppressor_voltage_v, total_current_ua, flags_hex,
-                column_ion_pump_pressure_pa)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            batch
-        )
-
-
-    def _persist_sessions(self, sessions: List[Session]) -> None:
-        """Persist sessions to main database."""
+            return {"status": "error", "message": "No events parsed from file", "record_count": 0}
+        sessions = self.session_builder.build_sessions(events, file_path)
+        # Vacuum analysis
+        pump_warn = float(self.db.get_setting("pump_time_warning_seconds", "300"))
+        pump_crit = float(self.db.get_setting("pump_time_critical_seconds", "600"))
+        idle_thresh = float(self.db.get_setting("idle_after_ready_threshold_seconds", "1800"))
+        vacuum_analyzer = VacuumAnalyzer(pump_warn, pump_crit, idle_thresh)
+        vacuum_result = vacuum_analyzer.analyze_events(events, source_file=file_path)
+        # Cost calculation
+        rate = float(self.db.get_setting("rate_pln_per_hour", "150.0"))
+        billing = BillingService(rate_pln_per_hour=rate)
         for session in sessions:
-            cursor = self.db.conn.execute(
-                """INSERT INTO sessions
-                   (microscope_id, microscope_type, username,
-                    start_time, end_time, duration_seconds, status,
-                    billing_tier, hourly_rate, discount_percent,
-                    calculated_cost, hv_on_time, hv_off_time,
-                    gvl_open_time, gvl_close_time, source_file)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    session.microscope_id,
-                    session.microscope_type.value,
-                    session.username,
-                    session.start_time.isoformat() if session.start_time else None,
-                    session.end_time.isoformat() if session.end_time else None,
-                    session.duration_seconds,
-                    session.status.value,
-                    session.billing_tier.value,
-                    session.hourly_rate,
-                    session.discount_percent,
-                    session.calculated_cost,
-                    session.hv_on_time.isoformat() if session.hv_on_time else None,
-                    session.hv_off_time.isoformat() if session.hv_off_time else None,
-                    session.gvl_open_time.isoformat() if session.gvl_open_time else None,
-                    session.gvl_close_time.isoformat() if session.gvl_close_time else None,
-                    session.source_file,
-                )
-            )
-            session.id = cursor.lastrowid
-        self.db.conn.commit()
+            session.cost = billing.calculate_session_cost(session)
+        # Store data
+        record_count = self._store_history_data(file_path, file_hash, sessions, vacuum_result, operator)
+        return {
+            "status": "success",
+            "message": f"Imported {len(sessions)} sessions, {len(vacuum_result['cycles'])} vacuum cycles",
+            "record_count": record_count,
+            "sessions": len(sessions),
+            "vacuum_cycles": len(vacuum_result["cycles"]),
+            "penalties": len(vacuum_result["penalties"]),
+            "anomalies": len(vacuum_result["anomalies"]),
+        }
 
-    def _persist_vacuum(self, cycles: List[VacuumCycle],
-                        penalties: List[Penalty]) -> None:
-        """Persist vacuum cycles and penalties to main database."""
-        for cycle in cycles:
-            cursor = self.db.conn.execute(
-                """INSERT INTO vacuum_cycles
-                   (microscope_id, session_id, username, command,
-                    start_time, end_time, duration_seconds,
-                    status, ready_time_seconds, source_file)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    cycle.microscope_id,
-                    cycle.session_id,
-                    cycle.username,
-                    cycle.command,
-                    cycle.start_time.isoformat() if cycle.start_time else None,
-                    cycle.end_time.isoformat() if cycle.end_time else None,
-                    cycle.duration_seconds,
-                    cycle.status.value,
-                    cycle.ready_time_seconds,
-                    cycle.source_file,
-                )
-            )
-            cycle.id = cursor.lastrowid
+    def _store_history_data(self, file_path, file_hash, sessions, vacuum_result, operator):
+        """Store parsed history data in database."""
+        record_count = 0
+        with self.db.get_cursor() as cursor:
+            for s in sessions:
+                cursor.execute(
+                    """INSERT INTO sessions (username, start_time, end_time, duration_seconds,
+                     gvl_total_seconds, gvl_cycle_count, status, cost, discount_percent,
+                     source_file, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (s.username, s.start_time.isoformat() if s.start_time else None,
+                     s.end_time.isoformat() if s.end_time else None, s.duration_seconds,
+                     s.gvl_total_seconds, len(s.gvl_cycles), s.status.value, s.cost,
+                     s.discount_percent, file_path, s.notes))
+                record_count += 1
+            for c in vacuum_result["cycles"]:
+                cursor.execute(
+                    """INSERT INTO vacuum_cycles (session_id, pump_start, ready_time, end_time,
+                     status, pump_duration_seconds, source_file) VALUES (?,?,?,?,?,?,?)""",
+                    (c.session_id, c.pump_start.isoformat() if c.pump_start else None,
+                     c.ready_time.isoformat() if c.ready_time else None,
+                     c.end_time.isoformat() if c.end_time else None,
+                     c.status.value, c.pump_duration_seconds, file_path))
+                record_count += 1
+            for p in vacuum_result["penalties"]:
+                cursor.execute(
+                    """INSERT INTO penalties (session_id, vacuum_cycle_id, penalty_type,
+                     amount_pln, username, timestamp, source_file, notes) VALUES (?,?,?,?,?,?,?,?)""",
+                    (p.session_id, p.vacuum_cycle_id, p.penalty_type, p.amount_pln,
+                     p.username, p.timestamp.isoformat() if p.timestamp else None, file_path, p.notes))
+                record_count += 1
+            for a in vacuum_result["anomalies"]:
+                cursor.execute(
+                    """INSERT INTO anomalies (anomaly_type, session_id, timestamp,
+                     duration_seconds, severity, description, source_file) VALUES (?,?,?,?,?,?,?)""",
+                    (a.anomaly_type.value, a.session_id,
+                     a.timestamp.isoformat() if a.timestamp else None,
+                     a.duration_seconds, a.severity, a.description, file_path))
+                record_count += 1
+            for err in self.history_parser.errors:
+                cursor.execute(
+                    "INSERT INTO parser_errors (source_file, line_number, raw_line, error_message) VALUES (?,?,?,?)",
+                    (err["source_file"], err["line_number"], err["raw_line"], err["error_message"]))
+            cursor.execute(
+                "INSERT INTO file_cache (file_path, file_hash, file_type, record_count) VALUES (?,?,?,?)",
+                (file_path, file_hash, FileType.HISTORY.value, record_count))
+            cursor.execute(
+                "INSERT INTO audit_log (action, entity_type, changed_by, new_value) VALUES (?,?,?,?)",
+                (AuditAction.IMPORT.value, "file", operator, f"{file_path} ({record_count} records)"))
+        return record_count
 
-        for penalty in penalties:
-            self.db.conn.execute(
-                """INSERT INTO penalties
-                   (vacuum_cycle_id, microscope_id, username,
-                    amount, reason, timestamp)
-                   VALUES (?,?,?,?,?,?)""",
-                (
-                    penalty.vacuum_cycle_id,
-                    penalty.microscope_id,
-                    penalty.username,
-                    penalty.amount,
-                    penalty.reason,
-                    penalty.timestamp.isoformat() if penalty.timestamp else None,
-                )
-            )
-        self.db.conn.commit()
+    def _import_hv(self, file_path: str, file_hash: str, operator: str) -> dict:
+        """Import an HV data log file."""
+        record_count = 0
+        with self.db.get_cursor() as cursor:
+            for batch in self.hv_parser.parse_file_batches(file_path):
+                for sample in batch:
+                    cursor.execute(
+                        """INSERT INTO hv_samples (timestamp, set_hv_kv, actual_hv_kv,
+                         emission_current_ua, emitter_current_a, heating_percent,
+                         gun_pressure_pa, chamber_pressure_pa, gun_valve_state, source_file)
+                         VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (sample.timestamp.isoformat() if sample.timestamp else None,
+                         sample.set_hv_kv, sample.actual_hv_kv, sample.emission_current_ua,
+                         sample.emitter_current_a, sample.heating_percent, sample.gun_pressure_pa,
+                         sample.chamber_pressure_pa, sample.gun_valve_state, file_path))
+                    record_count += 1
+            cursor.execute(
+                "INSERT INTO file_cache (file_path, file_hash, file_type, record_count) VALUES (?,?,?,?)",
+                (file_path, file_hash, FileType.HV.value, record_count))
+            for err in self.hv_parser.errors:
+                cursor.execute(
+                    "INSERT INTO parser_errors (source_file, line_number, raw_line, error_message) VALUES (?,?,?,?)",
+                    (err["source_file"], err["line_number"], err["raw_line"], err["error_message"]))
+            cursor.execute(
+                "INSERT INTO audit_log (action, entity_type, changed_by, new_value) VALUES (?,?,?,?)",
+                (AuditAction.IMPORT.value, "file", operator, f"{file_path} ({record_count} HV samples)"))
+        return {"status": "success", "message": f"Imported {record_count} HV samples", "record_count": record_count}
+
+    def delete_file(self, file_id: int, operator: str = "system") -> dict:
+        """Delete an imported file and ALL related data."""
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM file_cache WHERE id = ?", (file_id,))
+            file_record = cursor.fetchone()
+            if file_record is None:
+                return {"status": "error", "message": "File not found"}
+            file_path = file_record["file_path"]
+            deleted_counts = {}
+            tables = ["sessions", "vacuum_cycles", "hv_samples", "anomalies", "penalties", "parser_errors"]
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) as cnt FROM {table} WHERE source_file = ?", (file_path,))
+                count = cursor.fetchone()["cnt"]
+                cursor.execute(f"DELETE FROM {table} WHERE source_file = ?", (file_path,))
+                deleted_counts[table] = count
+            cursor.execute("DELETE FROM file_cache WHERE id = ?", (file_id,))
+            total_deleted = sum(deleted_counts.values())
+            cursor.execute(
+                """INSERT INTO audit_log (action, entity_type, entity_id, changed_by, old_value, new_value)
+                VALUES (?,?,?,?,?,?)""",
+                (AuditAction.DELETE_FILE.value, "file", file_id, operator,
+                 file_path, f"Deleted {total_deleted} records: {deleted_counts}"))
+        logger.info("Deleted file %s (ID %d): %s", file_path, file_id, deleted_counts)
+        return {"status": "success", "message": f"Deleted file and {total_deleted} related records",
+                "deleted_counts": deleted_counts}
+
+    def import_folder(self, folder_path: str, operator: str = "system") -> List[dict]:
+        """Recursively scan folder and import all log files."""
+        results = []
+        if not os.path.isdir(folder_path):
+            return [{"status": "error", "message": f"Not a directory: {folder_path}"}]
+        for root, _dirs, files in os.walk(folder_path):
+            for filename in sorted(files):
+                if not filename.endswith(".log"):
+                    continue
+                full_path = os.path.join(root, filename)
+                if self.detect_file_type(full_path) is not None:
+                    result = self.import_file(full_path, operator)
+                    result["file"] = full_path
+                    results.append(result)
+        return results

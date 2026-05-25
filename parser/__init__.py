@@ -1,4 +1,6 @@
-"""Parser package for TESCAN Log Analyzer."""
+"""Log parsers for TESCAN VEGA3 Log Analyzer."""
+
 from parser.log_parser import HistoryLogParser
 from parser.hv_parser import HVLogParser
-from parser.file_registry import FileRegistry
+
+__all__ = ["HistoryLogParser", "HVLogParser"]

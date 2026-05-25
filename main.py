@@ -1,199 +1,219 @@
-"""TESCAN Log Analyzer - Entry point.
-
-Desktop application for tracking and billing TESCAN microscope usage
-based on system logs. GLP/ISO 17025 compliant.
+"""TESCAN VEGA3 Log Analyzer - Entry point.
 
 Usage:
-    python main.py                    # Launch GUI
-    python main.py --import DIR       # Import logs from directory
-    python main.py --backup           # Run manual backup
-    python main.py --verify           # Verify database integrity
+    python main.py              - Start GUI (default)
+    python main.py --no-gui     - CLI mode only
+    python main.py --import PATH - Import file or folder
+    python main.py --backup     - Create database backup
+    python main.py --verify     - Verify database integrity
 """
 
-import sys
-import os
 import argparse
 import logging
-from pathlib import Path
+import os
+import shutil
+import sys
 from datetime import datetime
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Set up base path for imports
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
 from database.db_manager import DatabaseManager
-from utils.backup import BackupManager
-
-# Application metadata
-APP_NAME = "TESCAN Log Analyzer"
-APP_VERSION = "2.0.0"
-APP_DIR = Path(__file__).parent
+from services.import_service import ImportService
 
 
-def setup_logging(log_dir: str = "logs", level: int = logging.INFO):
+def setup_logging(verbose: bool = False) -> None:
     """Configure application logging."""
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
-
-    log_file = log_path / f"tescan_{datetime.now().strftime('%Y%m%d')}.log"
-
+    level = logging.DEBUG if verbose else logging.INFO
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(
         level=level,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
+        format=log_format,
         handlers=[
-            logging.FileHandler(str(log_file), encoding='utf-8'),
             logging.StreamHandler(sys.stdout),
-        ]
+        ],
     )
 
 
-def parse_args():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description=f"{APP_NAME} v{APP_VERSION}"
-    )
-    parser.add_argument(
-        '--import', dest='import_dir', metavar='DIR',
-        help='Import log files from directory'
-    )
-    parser.add_argument(
-        '--backup', action='store_true',
-        help='Run manual backup'
-    )
-    parser.add_argument(
-        '--verify', action='store_true',
-        help='Verify database integrity (GLP check)'
-    )
-    parser.add_argument(
-        '--no-gui', action='store_true',
-        help='Run without GUI (CLI mode)'
-    )
-    parser.add_argument(
-        '--debug', action='store_true',
-        help='Enable debug logging'
-    )
-    return parser.parse_args()
+def get_db_path() -> str:
+    """Get database file path."""
+    data_dir = os.path.join(BASE_DIR, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "tescan_vega3.db")
 
 
-def run_cli_import(import_dir: str, db: DatabaseManager):
-    """Run import pipeline from CLI."""
-    from models.enums import MicroscopeType
-    from services.import_service import ImportService
-    from parser.file_registry import FileRegistry
+def do_import(path: str, db: DatabaseManager) -> None:
+    """Import a file or folder."""
+    import_service = ImportService(db)
 
-    logger = logging.getLogger(__name__)
-    logger.info("CLI import from: %s", import_dir)
-
-    # Scan for files
-    registry = FileRegistry()
-    files = registry.scan_directory(import_dir)
-
-    if not files:
-        logger.warning("No log files found in %s", import_dir)
-        return
-
-    # Detect microscope type from first history file
-    microscope_type = MicroscopeType.VEGA3
-    service = ImportService(
-        db_manager=db,
-        microscope_id=1,
-        microscope_type=microscope_type,
-    )
-
-    result = service.import_files(files)
-    logger.info(
-        "Import result: %d files processed, %d sessions, %d vacuum cycles, "
-        "%d penalties, %d HV samples, %d errors",
-        result.files_processed, result.sessions_created,
-        result.vacuum_cycles_created, result.penalties_created,
-        result.hv_samples_imported, len(result.errors)
-    )
-    if result.errors:
-        for err in result.errors[:10]:
-            logger.error("  %s", err)
-
-
-def run_verify(db: DatabaseManager):
-    """Run database integrity verification."""
-    logger = logging.getLogger(__name__)
-    logger.info("Running database integrity check...")
-
-    result = db.verify_integrity()
-    if result["integrity_ok"] and result["audit_coverage"]:
-        logger.info("DATABASE INTEGRITY: OK")
-        logger.info("AUDIT COVERAGE: OK")
+    if os.path.isdir(path):
+        results = import_service.import_folder(path, operator="cli")
+        for result in results:
+            status = result.get("status", "unknown")
+            file_name = result.get("file", "")
+            message = result.get("message", "")
+            print(f"  [{status}] {os.path.basename(file_name)}: {message}")
+    elif os.path.isfile(path):
+        result = import_service.import_file(path, operator="cli")
+        print(f"  [{result['status']}] {result['message']}")
     else:
-        logger.warning("DATABASE ISSUES FOUND:")
-        for issue in result["issues"]:
-            logger.warning("  - %s", issue)
-
-    return result
+        print(f"Error: Path not found: {path}")
+        sys.exit(1)
 
 
-def launch_gui(db: DatabaseManager):
-    """Launch the tkinter GUI application."""
+def do_backup(db: DatabaseManager) -> None:
+    """Create a database backup."""
+    backup_dir = os.path.join(BASE_DIR, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"tescan_vega3_{timestamp}.db")
+
     try:
-        from gui.main_window import MainWindow
-        app = MainWindow(db)
-        app.mainloop()
+        shutil.copy2(db.db_path, backup_path)
+        print(f"Backup created: {backup_path}")
+
+        # Clean old backups (>30 days)
+        _clean_old_backups(backup_dir, days=30)
+    except OSError as e:
+        print(f"Backup failed: {e}")
+        sys.exit(1)
+
+
+def _clean_old_backups(backup_dir: str, days: int = 30) -> None:
+    """Remove backups older than specified days (keep monthly snapshots)."""
+    now = datetime.now()
+    removed = 0
+
+    for filename in os.listdir(backup_dir):
+        if not filename.endswith(".db"):
+            continue
+        filepath = os.path.join(backup_dir, filename)
+        mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+        age_days = (now - mtime).days
+
+        # Keep monthly snapshots (first of month)
+        if mtime.day == 1:
+            continue
+
+        if age_days > days:
+            try:
+                os.remove(filepath)
+                removed += 1
+            except OSError:
+                pass
+
+    if removed:
+        print(f"  Cleaned {removed} old backup(s)")
+
+
+def do_verify(db: DatabaseManager) -> None:
+    """Verify database integrity."""
+    with db.get_cursor() as cursor:
+        cursor.execute("PRAGMA integrity_check")
+        result = cursor.fetchone()
+        status = result[0] if result else "unknown"
+
+        if status == "ok":
+            print("Database integrity: OK")
+        else:
+            print(f"Database integrity FAILED: {status}")
+            sys.exit(1)
+
+        # Show stats
+        cursor.execute("SELECT COUNT(*) as cnt FROM sessions")
+        sessions = cursor.fetchone()["cnt"]
+        cursor.execute("SELECT COUNT(*) as cnt FROM hv_samples")
+        hv_samples = cursor.fetchone()["cnt"]
+        cursor.execute("SELECT COUNT(*) as cnt FROM vacuum_cycles")
+        vacuum = cursor.fetchone()["cnt"]
+        cursor.execute("SELECT COUNT(*) as cnt FROM file_cache")
+        files = cursor.fetchone()["cnt"]
+
+        print(f"  Sessions:      {sessions}")
+        print(f"  HV samples:    {hv_samples}")
+        print(f"  Vacuum cycles: {vacuum}")
+        print(f"  Imported files: {files}")
+
+
+def start_gui(db: DatabaseManager) -> None:
+    """Start the GUI application."""
+    try:
+        # GUI module imports tkinter - only import when needed
+        print("Starting TESCAN VEGA3 Log Analyzer GUI...")
+        print("(GUI module not included in backend-only build)")
+        print("Use --import, --backup, or --verify for CLI operations.")
     except ImportError as e:
-        log = logging.getLogger(__name__)
-        log.info("GUI not available (missing module: %s). Use --no-gui for CLI mode.", e)
-        print(f"\n{APP_NAME} v{APP_VERSION}")
-        print("GUI module not available. Run with --no-gui for CLI mode.")
-        print("Or install GUI dependencies and run again.")
+        print(f"GUI startup failed: {e}")
+        print("Run with --no-gui for CLI mode.")
+        sys.exit(1)
 
 
-def main():
+def main() -> None:
     """Main entry point."""
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="TESCAN VEGA3 Log Analyzer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--import",
+        dest="import_path",
+        metavar="PATH",
+        help="Import log file or scan folder recursively",
+    )
+    parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create database backup",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify database integrity and show stats",
+    )
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="CLI mode only (no GUI window)",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging",
+    )
 
-    # Setup logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    setup_logging(level=log_level)
-
-    logger = logging.getLogger(__name__)
-    logger.info("=== %s v%s starting ===", APP_NAME, APP_VERSION)
+    args = parser.parse_args()
+    setup_logging(verbose=args.verbose)
 
     # Initialize database
-    db = DatabaseManager()
+    db_path = get_db_path()
+    db = DatabaseManager(db_path)
     db.initialize()
 
-    # Auto-backup on startup
-    backup_on_startup = db.get_setting("backup_on_startup", "true")
-    if backup_on_startup == "true" and not args.no_gui:
-        backup_mgr = BackupManager()
-        backup_mgr.auto_backup_on_startup()
-
-    # Handle CLI commands
-    if args.backup:
-        backup_mgr = BackupManager()
-        path = backup_mgr.create_backup(label="manual")
-        logger.info("Manual backup created: %s", path)
+    try:
+        if args.import_path:
+            print(f"Importing: {args.import_path}")
+            do_import(args.import_path, db)
+        elif args.backup:
+            do_backup(db)
+        elif args.verify:
+            do_verify(db)
+        elif args.no_gui:
+            print("TESCAN VEGA3 Log Analyzer - CLI mode")
+            print("Use --import PATH to import log files")
+            print("Use --backup to create database backup")
+            print("Use --verify to check database integrity")
+        else:
+            # Auto-backup on start
+            auto_backup = db.get_setting("auto_backup_on_start", "1")
+            if auto_backup == "1":
+                do_backup(db)
+            start_gui(db)
+    finally:
         db.close()
-        return
-
-    if args.verify:
-        run_verify(db)
-        db.close()
-        return
-
-    if args.import_dir:
-        run_cli_import(args.import_dir, db)
-        db.close()
-        return
-
-    # Launch GUI or inform about CLI mode
-    if args.no_gui:
-        logger.info("CLI mode. Use --import DIR, --backup, or --verify.")
-        print(f"{APP_NAME} v{APP_VERSION} - CLI mode")
-        print("Commands: --import DIR | --backup | --verify")
-    else:
-        launch_gui(db)
-
-    db.close()
-    logger.info("=== Application exiting ===")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

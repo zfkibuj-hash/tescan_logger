@@ -1,7 +1,8 @@
 @echo off
-REM TESCAN Log Analyzer — Development runner
+REM TESCAN VEGA3 Log Analyzer - Development runner
 
-echo === TESCAN Log Analyzer (Dev Mode) ===
+echo === TESCAN VEGA3 Log Analyzer (dev) ===
+echo.
 
 REM Create venv if not exists
 if not exist "venv" (
@@ -12,10 +13,8 @@ if not exist "venv" (
 REM Activate venv
 call venv\Scripts\activate.bat
 
-REM Install deps
+REM Install requirements
 pip install -r requirements.txt -q
 
-REM Run
+REM Run application
 python main.py %*
-
-pause

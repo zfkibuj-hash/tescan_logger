@@ -1,109 +1,78 @@
-"""Enumerations for TESCAN Log Analyzer."""
+"""Enumerations for TESCAN VEGA3 Log Analyzer."""
 
-from enum import Enum, auto
-
-
-class MicroscopeType(Enum):
-    """Type of TESCAN microscope - immutable after registration."""
-    VEGA3 = "VEGA3"
-    MIRA3_FEG = "MIRA3_FEG"
+from enum import Enum
 
 
 class EventType(Enum):
-    """Types of events parsed from History logs."""
-    SESSION_START = auto()
-    SESSION_END = auto()
-    HV_ON = auto()
-    HV_OFF = auto()
-    FILAMENT_OFF = auto()
-    GVL_OPEN = auto()
-    GVL_CLOSE = auto()
-    VACUUM_PUMP = auto()
-    VACUUM_VENT = auto()
-    VACUUM_OFF = auto()
-    VACUUM_READY = auto()
-    SOFTWARE_START = auto()
-    SOFTWARE_TERMINATE = auto()
+    """Types of events parsed from history logs."""
+
+    SESSION_START = "SESSION_START"
+    SESSION_FINISH = "SESSION_FINISH"
+    HV_ON = "HV_ON"
+    HV_OFF = "HV_OFF"
+    HV_HEATING_OFF = "HV_HEATING_OFF"
+    HV_TURNING_ON = "HV_TURNING_ON"
+    HV_TURNING_OFF = "HV_TURNING_OFF"
+    GVL_OPEN = "GVL_OPEN"
+    GVL_CLOSE = "GVL_CLOSE"
+    PUMP = "PUMP"
+    VENT = "VENT"
+    VAC_OFF = "VAC_OFF"
+    VAC_READY = "VAC_READY"
+    SOFTWARE_START = "SOFTWARE_START"
+    SOFTWARE_TERMINATE = "SOFTWARE_TERMINATE"
+    SERIAL_NUMBER = "SERIAL_NUMBER"
+    FILAMENT_TIME = "FILAMENT_TIME"
+    VACUUM_TIME = "VACUUM_TIME"
+    CHAMBER_VIEW = "CHAMBER_VIEW"
+    ERROR = "ERROR"
+    UNKNOWN = "UNKNOWN"
 
 
 class SessionStatus(Enum):
-    """Status of a microscope session."""
+    """Status of a user session."""
+
     COMPLETE = "COMPLETE"
-    PARTIAL_SESSION = "PARTIAL_SESSION"
-    INCOMPLETE_CONTEXT = "INCOMPLETE_CONTEXT"
+    NO_MEASUREMENT = "NO_MEASUREMENT"
+    PARTIAL = "PARTIAL"
     CANCELLED = "CANCELLED"
 
 
 class VacuumStatus(Enum):
-    """Status of a vacuum cycle."""
-    OK = "OK"                    # PUMP -> READY
-    ABORTED = "ABORTED"          # PUMP -> VENT or PUMP -> OFF
-    LEFT_VENTED = "LEFT_VENTED"  # VENT -> OFF -> penalty 100 PLN
-    IN_PROGRESS = "IN_PROGRESS"  # cycle not yet finished
+    """Status of a vacuum pump cycle."""
 
-
-class BillingTier(Enum):
-    """Billing tier for a session - determines rate multiplier."""
-    PROJECT = "PROJECT"      # Research projects (default)
-    UJ_UNIT = "UJ_UNIT"      # Jagiellonian University internal units
-    EXTERNAL = "EXTERNAL"    # External entities
-
-
-class AuditAction(Enum):
-    """Actions recorded in audit log."""
-    CREATE = "CREATE"
-    EDIT = "EDIT"
-    CANCEL = "CANCEL"
-    OVERRIDE_COST = "OVERRIDE_COST"
-    OVERRIDE_TIME = "OVERRIDE_TIME"
-    CHANGE_TIER = "CHANGE_TIER"
-    CHANGE_RATE = "CHANGE_RATE"
-    CHANGE_DISCOUNT = "CHANGE_DISCOUNT"
-    IMPORT = "IMPORT"
-    EXPORT = "EXPORT"
-    BACKUP = "BACKUP"
-    SETTINGS_CHANGE = "SETTINGS_CHANGE"
-    DELETE = "DELETE"
-    LOGIN = "LOGIN"
-    EXCLUDE_INVOICE = "EXCLUDE_INVOICE"
-
-
-class UserRole(Enum):
-    """User roles with different permission levels."""
-    ADMIN = "admin"        # Full access + settings + user management
-    OPERATOR = "operator"  # Import, edit sessions, PPM operations
-
-
-class FileType(Enum):
-    """Types of log files."""
-    HISTORY = "HISTORY"
-    HV = "HV"
-    UNKNOWN = "UNKNOWN"
-
-
-class HeatmapType(Enum):
-    """Types of heatmaps available."""
-    USAGE_TIME = "usage_time"
-    PUMPING_TIME = "pumping_time"
-    PENALTIES = "penalties"
-    VACUUM_ANOMALIES = "vacuum_anomalies"
-    IDLE_TIME = "idle_time"
-    GVL_OPEN_TIME = "gvl_open_time"
-
-
-class HeatmapGranularity(Enum):
-    """Time granularity for heatmaps."""
-    HOURLY = "hourly"
-    DAILY = "daily"
-    MONTHLY = "monthly"
+    OK = "OK"
+    ABORTED = "ABORTED"
+    LEFT_VENTED = "LEFT_VENTED"
+    IN_PROGRESS = "IN_PROGRESS"
 
 
 class AnomalyType(Enum):
     """Types of detected anomalies."""
-    PRESSURE_SPIKE = "pressure_spike"
-    EMISSION_DRIFT = "emission_drift"
-    VACUUM_DEGRADATION = "vacuum_degradation"
-    HV_INSTABILITY = "hv_instability"
-    LONG_PUMP_TIME = "long_pump_time"
-    IDLE_AFTER_READY = "idle_after_ready"
-    HV_LOG_GAP = "hv_log_gap"
+
+    LONG_PUMP_TIME = "LONG_PUMP_TIME"
+    IDLE_AFTER_READY = "IDLE_AFTER_READY"
+
+
+class AuditAction(Enum):
+    """Types of audit log actions."""
+
+    IMPORT = "IMPORT"
+    DELETE_FILE = "DELETE_FILE"
+    EDIT = "EDIT"
+    CANCEL = "CANCEL"
+    OVERRIDE_COST = "OVERRIDE_COST"
+    OVERRIDE_TIME = "OVERRIDE_TIME"
+    CHANGE_DISCOUNT = "CHANGE_DISCOUNT"
+    EXCLUDE_BILLING = "EXCLUDE_BILLING"
+    CHANGE_SETTING = "CHANGE_SETTING"
+    ADD_USER = "ADD_USER"
+    EDIT_USER = "EDIT_USER"
+    DELETE_USER = "DELETE_USER"
+
+
+class FileType(Enum):
+    """Types of log files."""
+
+    HISTORY = "HISTORY"
+    HV = "HV"

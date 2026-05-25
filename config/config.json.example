@@ -1,30 +1,31 @@
 {
     "database": {
-        "main_db": "tescan_logger.db",
-        "hv_db": "tescan_hv.db"
+        "path": "data/tescan_vega3.db"
+    },
+    "billing": {
+        "rate_pln_per_hour": 150.0,
+        "penalty_left_vented_pln": 100.0
+    },
+    "anomaly_thresholds": {
+        "pump_time_warning_seconds": 300,
+        "pump_time_critical_seconds": 600,
+        "idle_after_ready_threshold_seconds": 1800
     },
     "backup": {
-        "auto_on_startup": true,
+        "auto_backup_on_start": true,
         "retention_days": 30,
         "backup_dir": "backups"
     },
-    "import": {
-        "default_directory": "",
-        "history_pattern": "History-\\d{4}-\\d{2}\\.log$",
-        "hv_pattern": "hv[-_].*\\d{4}-\\d{2}.*\\.log$"
+    "microscope": {
+        "type": "VEGA3",
+        "serial_number": ""
     },
-    "billing": {
-        "default_tier": "PROJECT",
-        "penalty_amount_pln": 100.0
-    },
-    "glp": {
-        "require_pin": false,
-        "data_retention_years": 5
-    },
-    "heatmap_colors": [
-        {"value": 0.0, "color": "#FFFFFF"},
-        {"value": 0.01, "color": "#00FF00"},
-        {"value": 0.5, "color": "#FFFF00"},
-        {"value": 1.0, "color": "#FF0000"}
-    ]
+    "heatmap_colors": {
+        "no_data": "#FFFFFF",
+        "points": [
+            {"value": 0, "color": "#00CC00"},
+            {"value": 50, "color": "#FFCC00"},
+            {"value": 100, "color": "#FF0000"}
+        ]
+    }
 }

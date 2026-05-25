@@ -1,197 +1,170 @@
-"""Data classes for TESCAN Log Analyzer."""
+"""Data classes for TESCAN VEGA3 Log Analyzer."""
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 from models.enums import (
-    EventType, SessionStatus, VacuumStatus, MicroscopeType,
-    AuditAction, UserRole, AnomalyType, BillingTier
+    EventType,
+    SessionStatus,
+    VacuumStatus,
+    AnomalyType,
+    AuditAction,
+    FileType,
 )
 
 
 @dataclass
 class ParsedEvent:
-    """Single event parsed from a History log line."""
+    """A single parsed event from the history log."""
+
     timestamp: datetime
     event_type: EventType
     raw_line: str
-    username: Optional[str] = None
     details: Optional[str] = None
+    source_file: Optional[str] = None
     line_number: int = 0
-    source_file: str = ""
+
+
+@dataclass
+class GVLCycle:
+    """A single GVL open->close cycle within a session."""
+
+    open_time: datetime
+    close_time: Optional[datetime] = None
+
+    @property
+    def duration_seconds(self) -> float:
+        """Duration in seconds of this GVL cycle."""
+        if self.close_time is None:
+            return 0.0
+        delta = self.close_time - self.open_time
+        return delta.total_seconds()
 
 
 @dataclass
 class Session:
-    """Microscope usage session."""
+    """A user session on the microscope."""
+
     id: Optional[int] = None
-    microscope_id: int = 0
-    microscope_type: MicroscopeType = MicroscopeType.VEGA3
     username: str = ""
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     duration_seconds: float = 0.0
+    gvl_total_seconds: float = 0.0
+    gvl_cycles: list = field(default_factory=list)
     status: SessionStatus = SessionStatus.COMPLETE
-    # Billing
-    billing_tier: BillingTier = BillingTier.PROJECT
-    hourly_rate: float = 150.0
-    rate_override: Optional[float] = None
+    cost: float = 0.0
     discount_percent: float = 0.0
-    calculated_cost: float = 0.0
-    cost_override: Optional[float] = None
-    time_override_minutes: Optional[float] = None
-    excluded_from_invoice: bool = False
-    cancelled: bool = False
-    # HV/GVL markers
-    hv_on_time: Optional[datetime] = None
-    hv_off_time: Optional[datetime] = None
-    gvl_open_time: Optional[datetime] = None
-    gvl_close_time: Optional[datetime] = None
-    # Metadata
-    notes: Optional[str] = None
+    override_cost: Optional[float] = None
+    override_time_minutes: Optional[float] = None
+    excluded_from_billing: bool = False
     source_file: str = ""
-    version: int = 1
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+    notes: str = ""
 
     @property
-    def effective_rate(self) -> float:
-        """Effective hourly rate (override or default)."""
-        if self.rate_override is not None:
-            return self.rate_override
-        return self.hourly_rate
-
-    @property
-    def effective_duration_seconds(self) -> float:
-        """Duration after applying time override."""
-        if self.time_override_minutes is not None:
-            return self.time_override_minutes * 60.0
-        return self.duration_seconds
-
-    @property
-    def effective_cost(self) -> float:
-        """Final cost after all overrides and discounts."""
-        if self.cancelled:
-            return 0.0
-        if self.cost_override is not None:
-            return self.cost_override
-        # Discount reduces TIME, not rate
-        effective_hours = self.effective_duration_seconds / 3600.0
-        discount_factor = 1.0 - (self.discount_percent / 100.0)
-        billable_hours = effective_hours * discount_factor
-        return round(billable_hours * self.effective_rate, 2)
-
-    @property
-    def duration_minutes(self) -> float:
-        """Duration in minutes."""
-        return self.effective_duration_seconds / 60.0
+    def billable_seconds(self) -> float:
+        """Effective billable time after discount."""
+        if self.override_time_minutes is not None:
+            return self.override_time_minutes * 60.0
+        effective = self.gvl_total_seconds * (1.0 - self.discount_percent / 100.0)
+        return max(effective, 0.0)
 
 
 @dataclass
 class VacuumCycle:
-    """A vacuum pump/vent cycle with status tracking."""
+    """A vacuum pump cycle (PUMP -> READY/VENT/OFF)."""
+
     id: Optional[int] = None
-    microscope_id: int = 0
     session_id: Optional[int] = None
-    username: Optional[str] = None
-    command: str = ""  # PUMP, VENT, OFF
-    start_time: Optional[datetime] = None
+    pump_start: Optional[datetime] = None
+    ready_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    duration_seconds: float = 0.0
     status: VacuumStatus = VacuumStatus.IN_PROGRESS
-    ready_time_seconds: Optional[float] = None
+    pump_duration_seconds: float = 0.0
     source_file: str = ""
-    created_at: Optional[datetime] = None
+
+
+@dataclass
+class HVSample:
+    """A single HV data sample (1 per second)."""
+
+    id: Optional[int] = None
+    timestamp: Optional[datetime] = None
+    set_hv_kv: float = 0.0
+    actual_hv_kv: float = 0.0
+    emission_current_ua: float = 0.0
+    emitter_current_a: float = 0.0
+    heating_percent: float = 0.0
+    gun_pressure_pa: float = 0.0
+    chamber_pressure_pa: float = 0.0
+    gun_valve_state: str = "Closed"
+    source_file: str = ""
 
 
 @dataclass
 class User:
-    """Microscope operator/user."""
+    """A microscope user."""
+
     id: Optional[int] = None
     username: str = ""
     display_name: str = ""
-    role: UserRole = UserRole.OPERATOR
     discount_percent: float = 0.0
     excluded_from_billing: bool = False
-    pin_hash: Optional[str] = None  # For GLP operator confirmation
-    email: Optional[str] = None
-    notes: Optional[str] = None
-    active: bool = True
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-@dataclass
-class Microscope:
-    """Registered microscope - type is immutable after creation."""
-    id: Optional[int] = None
-    name: str = ""
-    serial_number: str = ""
-    microscope_type: MicroscopeType = MicroscopeType.VEGA3  # IMMUTABLE
-    location: str = ""
-    notes: Optional[str] = None
-    active: bool = True
-    created_at: Optional[datetime] = None
-
-    @property
-    def default_rate(self) -> float:
-        """Default hourly rate based on microscope type."""
-        if self.microscope_type == MicroscopeType.MIRA3_FEG:
-            return 225.0
-        return 150.0
-
-
-@dataclass
-class BillingTierConfig:
-    """Billing tier rate configuration per microscope."""
-    id: Optional[int] = None
-    microscope_id: int = 0
-    tier: BillingTier = BillingTier.PROJECT
-    rate_pln_per_hour: float = 150.0
-
-
-@dataclass
-class Anomaly:
-    """Detected anomaly during log analysis."""
-    id: Optional[int] = None
-    microscope_id: int = 0
-    session_id: Optional[int] = None
-    anomaly_type: AnomalyType = AnomalyType.PRESSURE_SPIKE
-    severity: str = "warning"  # info, warning, critical
-    timestamp: Optional[datetime] = None
-    description: str = ""
-    value: Optional[float] = None
-    threshold: Optional[float] = None
-    source_file: str = ""
-    resolved: bool = False
+    pin_hash: Optional[str] = None
     created_at: Optional[datetime] = None
 
 
 @dataclass
 class Penalty:
-    """Penalty for LEFT_VENTED vacuum cycle - always 100 PLN."""
+    """A penalty record (e.g. LEFT_VENTED)."""
+
     id: Optional[int] = None
-    vacuum_cycle_id: int = 0
-    microscope_id: int = 0
+    session_id: Optional[int] = None
+    vacuum_cycle_id: Optional[int] = None
+    penalty_type: str = "LEFT_VENTED"
+    amount_pln: float = 100.0
     username: str = ""
-    amount: float = 100.0
-    reason: str = "LEFT_VENTED"
     timestamp: Optional[datetime] = None
-    paid: bool = False
-    notes: Optional[str] = None
-    created_at: Optional[datetime] = None
+    source_file: str = ""
+    notes: str = ""
+
+
+@dataclass
+class Anomaly:
+    """A detected anomaly."""
+
+    id: Optional[int] = None
+    anomaly_type: AnomalyType = AnomalyType.LONG_PUMP_TIME
+    session_id: Optional[int] = None
+    timestamp: Optional[datetime] = None
+    duration_seconds: float = 0.0
+    severity: str = "warning"
+    description: str = ""
+    source_file: str = ""
 
 
 @dataclass
 class AuditEntry:
-    """Audit log entry - GLP compliant, UTC timestamps."""
+    """An audit log entry."""
+
     id: Optional[int] = None
     action: AuditAction = AuditAction.EDIT
-    entity_type: str = ""  # 'session', 'user', 'vacuum_cycle', etc.
+    entity_type: str = ""
     entity_id: Optional[int] = None
-    changed_by: str = ""  # current operator username
-    old_value: Optional[str] = None  # JSON
-    new_value: Optional[str] = None  # JSON
-    description: Optional[str] = None
-    created_at: Optional[datetime] = None  # UTC
+    changed_by: str = "system"
+    old_value: str = ""
+    new_value: str = ""
+    created_at: Optional[datetime] = None
+
+
+@dataclass
+class FileRecord:
+    """Record of an imported file."""
+
+    id: Optional[int] = None
+    file_path: str = ""
+    file_hash: str = ""
+    file_type: FileType = FileType.HISTORY
+    import_date: Optional[datetime] = None
+    record_count: int = 0

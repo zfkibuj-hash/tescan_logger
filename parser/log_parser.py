@@ -1,184 +1,222 @@
-"""History log parser for TESCAN microscopes.
+"""History log parser for TESCAN VEGA3.
 
-Parses History-YYYY-MM.log files to extract session events, vacuum commands,
-and HV state changes. Uses regex pattern matching on each line.
+Parses History-YYYY-MM.log files with format:
+YYYY-MM-DD HH:MM:SS.fff [I] event text
+YYYY-MM-DD HH:MM:SS.fff [E] error text
 """
 
 import re
 import logging
 from datetime import datetime
-from pathlib import Path
-from typing import List, Generator
+from typing import List, Optional, Generator
 
-from models.enums import EventType, MicroscopeType
+from models.enums import EventType
 from models.dataclasses import ParsedEvent
 
 logger = logging.getLogger(__name__)
 
-# Timestamp pattern: 2026-05-05 15:51:27.416 [I]
-TIMESTAMP_PATTERN = re.compile(
-    r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\[I\]\s+(.*)'
-)
+# Base timestamp pattern
+TIMESTAMP_RE = r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})"
+LEVEL_RE = r"\[(I|E)\]"
+LINE_RE = re.compile(rf"^{TIMESTAMP_RE}\s+{LEVEL_RE}\s+(.*)$")
 
-# Event patterns
-EVENT_PATTERNS = {
-    EventType.SESSION_START: re.compile(
-        r'==\s*Session started for user:\s*(.+?)\s*=='
+# Event patterns - order matters for matching priority
+EVENT_PATTERNS = [
+    (
+        re.compile(r"==\s*Session started for user:\s*(\S+)\s*==", re.IGNORECASE),
+        EventType.SESSION_START,
     ),
-    EventType.SESSION_END: re.compile(
-        r'==\s*Session finished\s*=='
+    (
+        re.compile(r"==\s*Session finished\s*==", re.IGNORECASE),
+        EventType.SESSION_FINISH,
     ),
-    EventType.HV_ON: re.compile(
-        r'HV:\s*HV has been turned ON'
+    (
+        re.compile(r"HV:\s*HV has been turned ON", re.IGNORECASE),
+        EventType.HV_ON,
     ),
-    EventType.HV_OFF: re.compile(
-        r'HV:\s*HV has been turned OFF'
+    (
+        re.compile(r"HV:\s*HV has been turned OFF", re.IGNORECASE),
+        EventType.HV_OFF,
     ),
-    EventType.FILAMENT_OFF: re.compile(
-        r'HV:\s*HV heating has been turned OFF'
+    (
+        re.compile(r"HV:\s*HV heating has been turned OFF", re.IGNORECASE),
+        EventType.HV_HEATING_OFF,
     ),
-    EventType.GVL_OPEN: re.compile(
-        r'Vacuum:\s*command GVL open'
+    (
+        re.compile(r"HV:\s*HV is being turned ON", re.IGNORECASE),
+        EventType.HV_TURNING_ON,
     ),
-    EventType.GVL_CLOSE: re.compile(
-        r'Vacuum:\s*command GVL close'
+    (
+        re.compile(r"HV:\s*HV is being turned OFF", re.IGNORECASE),
+        EventType.HV_TURNING_OFF,
     ),
-    EventType.VACUUM_PUMP: re.compile(
-        r'Vacuum:\s*command PUMP'
+    (
+        re.compile(r"Vacuum:\s*command GVL open", re.IGNORECASE),
+        EventType.GVL_OPEN,
     ),
-    EventType.VACUUM_VENT: re.compile(
-        r'Vacuum:\s*command VENT'
+    (
+        re.compile(r"Vacuum:\s*command GVL close", re.IGNORECASE),
+        EventType.GVL_CLOSE,
     ),
-    EventType.VACUUM_OFF: re.compile(
-        r'Vacuum:\s*command OFF'
+    (
+        re.compile(r"Vacuum:\s*command PUMP", re.IGNORECASE),
+        EventType.PUMP,
     ),
-    EventType.VACUUM_READY: re.compile(
-        r'Vacuum:\s*(?:Vacuum:\s*)?ready in\s+(\d+)\s*s'
+    (
+        re.compile(r"Vacuum:\s*command VENT", re.IGNORECASE),
+        EventType.VENT,
     ),
-    EventType.SOFTWARE_START: re.compile(
-        r'==\s*Starting software\s*=='
+    (
+        re.compile(r"Vacuum:\s*command OFF", re.IGNORECASE),
+        EventType.VAC_OFF,
     ),
-    EventType.SOFTWARE_TERMINATE: re.compile(
-        r'==\s*Terminating software\s*=='
+    (
+        re.compile(r"Vacuum:\s*Vacuum:\s*ready in\s+(\d+)\s*s", re.IGNORECASE),
+        EventType.VAC_READY,
     ),
-}
+    (
+        re.compile(r"==\s*Starting software\s*==", re.IGNORECASE),
+        EventType.SOFTWARE_START,
+    ),
+    (
+        re.compile(r"==\s*Terminating software\s*==", re.IGNORECASE),
+        EventType.SOFTWARE_TERMINATE,
+    ),
+    (
+        re.compile(r"SN:\s*(VG\S+)", re.IGNORECASE),
+        EventType.SERIAL_NUMBER,
+    ),
+    (
+        re.compile(
+            r"HV:\s*Filament time:\s*(\d+)\s*h\s*(\d+)\s*min.*type:\s*(\w+)",
+            re.IGNORECASE,
+        ),
+        EventType.FILAMENT_TIME,
+    ),
+    (
+        re.compile(r"Vacuum:\s*Vacuum time:\s*(\d+)\s*h\s*(\d+)\s*min", re.IGNORECASE),
+        EventType.VACUUM_TIME,
+    ),
+    (
+        re.compile(r"ChamberView:\s*starting live image", re.IGNORECASE),
+        EventType.CHAMBER_VIEW,
+    ),
+]
 
 
 class HistoryLogParser:
-    """Parser for History-YYYY-MM.log files.
-
-    Extracts structured events from TESCAN history log files.
-    Auto-detects microscope type based on event patterns found.
-    """
+    """Parser for VEGA3 history log files."""
 
     def __init__(self):
         self.errors: List[dict] = []
 
     def parse_file(self, file_path: str) -> List[ParsedEvent]:
-        """Parse entire History log file into list of events.
-
-        Args:
-            file_path: Path to the History log file.
-
-        Returns:
-            List of ParsedEvent objects in chronological order.
-        """
-        events = list(self.parse_file_generator(file_path))
-        logger.info("Parsed %d events from %s", len(events), file_path)
-        return events
-
-    def parse_file_generator(self, file_path: str) -> Generator[ParsedEvent, None, None]:
-        """Parse History log file as a generator (memory efficient).
-
-        Yields ParsedEvent objects one by one.
-        """
-        path = Path(file_path)
-        if not path.exists():
-            logger.error("File not found: %s", file_path)
-            return
+        """Parse an entire history log file and return events."""
+        events = []
+        self.errors = []
 
         try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                for line_number, line in enumerate(f, start=1):
-                    line = line.rstrip('\n\r')
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line_num, line in enumerate(f, start=1):
+                    line = line.rstrip("\n\r")
                     if not line.strip():
                         continue
-
-                    event = self._parse_line(line, line_number, str(file_path))
+                    event = self._parse_line(line, line_num, file_path)
                     if event is not None:
-                        yield event
-        except IOError as e:
-            logger.error("Error reading file %s: %s", file_path, e)
+                        events.append(event)
+        except OSError as e:
+            logger.error("Failed to read file %s: %s", file_path, e)
             self.errors.append({
-                "file_path": str(file_path),
+                "source_file": file_path,
                 "line_number": 0,
-                "error_message": f"IO error: {e}",
+                "raw_line": "",
+                "error_message": str(e),
             })
 
-    def _parse_line(self, line: str, line_number: int, source_file: str) -> ParsedEvent | None:
-        """Parse a single log line into a ParsedEvent or None."""
-        # Extract timestamp and content
-        ts_match = TIMESTAMP_PATTERN.match(line)
-        if not ts_match:
-            return None
+        logger.info(
+            "Parsed %d events from %s (%d errors)",
+            len(events), file_path, len(self.errors),
+        )
+        return events
 
-        timestamp_str = ts_match.group(1)
-        content = ts_match.group(2)
+    def parse_file_generator(
+        self, file_path: str
+    ) -> Generator[ParsedEvent, None, None]:
+        """Parse a history log file as a generator (memory efficient)."""
+        self.errors = []
 
         try:
-            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S.%f')
-        except ValueError:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line_num, line in enumerate(f, start=1):
+                    line = line.rstrip("\n\r")
+                    if not line.strip():
+                        continue
+                    event = self._parse_line(line, line_num, file_path)
+                    if event is not None:
+                        yield event
+        except OSError as e:
+            logger.error("Failed to read file %s: %s", file_path, e)
+
+    def _parse_line(
+        self, line: str, line_num: int, file_path: str
+    ) -> Optional[ParsedEvent]:
+        """Parse a single log line into a ParsedEvent."""
+        match = LINE_RE.match(line)
+        if not match:
             self.errors.append({
-                "file_path": source_file,
-                "line_number": line_number,
-                "raw_line": line[:200],
-                "error_message": f"Invalid timestamp: {timestamp_str}",
+                "source_file": file_path,
+                "line_number": line_num,
+                "raw_line": line[:500],
+                "error_message": "Line does not match expected format",
             })
             return None
 
-        # Match against event patterns
-        for event_type, pattern in EVENT_PATTERNS.items():
-            match = pattern.search(content)
-            if match:
-                username = None
-                details = None
+        timestamp_str = match.group(1)
+        level = match.group(2)
+        content = match.group(3)
 
-                if event_type == EventType.SESSION_START:
-                    username = match.group(1).strip()
-                elif event_type == EventType.VACUUM_READY:
-                    details = match.group(1)  # ready time in seconds
+        try:
+            timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S.%f")
+        except ValueError as e:
+            self.errors.append({
+                "source_file": file_path,
+                "line_number": line_num,
+                "raw_line": line[:500],
+                "error_message": f"Invalid timestamp: {e}",
+            })
+            return None
 
-                return ParsedEvent(
-                    timestamp=timestamp,
-                    event_type=event_type,
-                    raw_line=line,
-                    username=username,
-                    details=details,
-                    line_number=line_number,
-                    source_file=source_file,
-                )
+        # Error lines
+        if level == "E":
+            return ParsedEvent(
+                timestamp=timestamp,
+                event_type=EventType.ERROR,
+                raw_line=line,
+                details=content,
+                source_file=file_path,
+                line_number=line_num,
+            )
 
-        return None
+        # Match against known event patterns
+        event_type, details = self._classify_event(content)
 
-    def detect_microscope_type(self, events: List[ParsedEvent]) -> MicroscopeType:
-        """Auto-detect microscope type from parsed events.
-
-        Rules:
-        - Presence of GVL_OPEN or GVL_CLOSE -> MIRA3_FEG
-        - Presence of HV_ON without GVL events -> VEGA3
-        """
-        has_gvl = any(
-            e.event_type in (EventType.GVL_OPEN, EventType.GVL_CLOSE)
-            for e in events
+        return ParsedEvent(
+            timestamp=timestamp,
+            event_type=event_type,
+            raw_line=line,
+            details=details,
+            source_file=file_path,
+            line_number=line_num,
         )
-        if has_gvl:
-            return MicroscopeType.MIRA3_FEG
-        return MicroscopeType.VEGA3
 
-    def get_errors(self) -> List[dict]:
-        """Get list of parsing errors encountered."""
-        return self.errors.copy()
+    def _classify_event(self, content: str) -> tuple:
+        """Classify event content into an EventType and extract details."""
+        for pattern, event_type in EVENT_PATTERNS:
+            m = pattern.search(content)
+            if m:
+                # Return matched groups as details if any
+                groups = m.groups()
+                details = groups[0] if len(groups) == 1 else "|".join(groups) if groups else content
+                return event_type, details
 
-    def clear_errors(self) -> None:
-        """Clear stored parsing errors."""
-        self.errors.clear()
+        return EventType.UNKNOWN, content

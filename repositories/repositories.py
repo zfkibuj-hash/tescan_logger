@@ -1,556 +1,317 @@
-"""Repository classes for main database entities.
-
-Implements Repository Pattern for clean data access.
-All modifications go through audit trail.
-"""
+"""Repository classes for data access with audit trail."""
 
 import json
 import logging
-from datetime import datetime
 from typing import List, Optional, Dict
 
-from models.enums import (
-    SessionStatus, MicroscopeType, AuditAction,
-    BillingTier, UserRole, VacuumStatus
-)
-from models.dataclasses import (
-    Session, VacuumCycle, User, Microscope, AuditEntry,
-    Penalty, BillingTierConfig
-)
+from database.db_manager import DatabaseManager
+from models.enums import AuditAction, SessionStatus
 
 logger = logging.getLogger(__name__)
 
 
+class BaseRepository:
+    """Base repository with common operations."""
 
-class AuditRepository:
-    """Repository for audit log entries (GLP compliance)."""
+    def __init__(self, db: DatabaseManager):
+        self.db = db
 
-    def __init__(self, db_manager):
-        self.db = db_manager
-
-    def log_action(
-        self, action: AuditAction, entity_type: str,
-        entity_id: Optional[int], changed_by: str,
-        old_value=None, new_value=None, description: str = ""
-    ) -> None:
-        """Record an audit trail entry."""
-        self.db.conn.execute(
-            """INSERT INTO audit_log
-               (action, entity_type, entity_id, changed_by,
-                old_value, new_value, description)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                action.value, entity_type, entity_id, changed_by,
-                json.dumps(old_value) if old_value else None,
-                json.dumps(new_value) if new_value else None,
-                description,
-            )
-        )
-        self.db.conn.commit()
-
-    def get_history(
-        self, entity_type: str, entity_id: int
-    ) -> List[AuditEntry]:
-        """Get audit history for a specific entity."""
-        rows = self.db.conn.execute(
-            """SELECT * FROM audit_log
-               WHERE entity_type = ? AND entity_id = ?
-               ORDER BY created_at DESC""",
-            (entity_type, entity_id)
-        ).fetchall()
-        return [self._row_to_entry(r) for r in rows]
-
-    def get_all(self, limit: int = 100) -> List[AuditEntry]:
-        """Get recent audit entries."""
-        rows = self.db.conn.execute(
-            "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-        return [self._row_to_entry(r) for r in rows]
-
-    def _row_to_entry(self, row) -> AuditEntry:
-        return AuditEntry(
-            id=row["id"],
-            action=AuditAction(row["action"]),
-            entity_type=row["entity_type"],
-            entity_id=row["entity_id"],
-            changed_by=row["changed_by"],
-            old_value=row["old_value"],
-            new_value=row["new_value"],
-            description=row["description"],
-            created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
-        )
+    def _audit(self, cursor, action, entity_type, entity_id, changed_by, old_val="", new_val=""):
+        """Write an audit log entry."""
+        cursor.execute(
+            "INSERT INTO audit_log (action, entity_type, entity_id, changed_by, old_value, new_value) VALUES (?,?,?,?,?,?)",
+            (action.value, entity_type, entity_id, changed_by, old_val, new_val))
 
 
+class SessionRepository(BaseRepository):
+    """Repository for session data access."""
 
-class SessionRepository:
-    """Repository for Session entities."""
-
-    def __init__(self, db_manager, audit_repo: AuditRepository):
-        self.db = db_manager
-        self.audit = audit_repo
-
-    def get_by_id(self, session_id: int) -> Optional[Session]:
-        """Get session by ID."""
-        row = self.db.conn.execute(
-            "SELECT * FROM sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        return self._row_to_session(row) if row else None
-
-    def get_all(
-        self, microscope_id: Optional[int] = None,
-        username: Optional[str] = None,
-        status: Optional[SessionStatus] = None,
-        start_after: Optional[str] = None,
-        start_before: Optional[str] = None,
-        limit: int = 500,
-    ) -> List[Session]:
+    def get_all(self, username=None, status=None, start_date=None, end_date=None) -> List[dict]:
         """Get sessions with optional filters."""
         query = "SELECT * FROM sessions WHERE 1=1"
         params = []
-
-        if microscope_id:
-            query += " AND microscope_id = ?"
-            params.append(microscope_id)
         if username:
             query += " AND username = ?"
             params.append(username)
         if status:
             query += " AND status = ?"
-            params.append(status.value)
-        if start_after:
+            params.append(status)
+        if start_date:
             query += " AND start_time >= ?"
-            params.append(start_after)
-        if start_before:
+            params.append(start_date)
+        if end_date:
             query += " AND start_time <= ?"
-            params.append(start_before)
+            params.append(end_date)
+        query += " ORDER BY start_time DESC"
+        with self.db.get_cursor() as cursor:
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
 
-        query += " ORDER BY start_time DESC LIMIT ?"
-        params.append(limit)
+    def get_by_id(self, session_id: int) -> Optional[dict]:
+        """Get a single session by ID."""
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
-        rows = self.db.conn.execute(query, params).fetchall()
-        return [self._row_to_session(r) for r in rows]
-
-    def update_discount(
-        self, session_id: int, discount: float, changed_by: str
-    ) -> None:
-        """Update session discount (reduces time, not rate)."""
+    def update_discount(self, session_id: int, discount_percent: float, changed_by: str) -> bool:
+        """Update session discount percent (PPM)."""
         old = self.get_by_id(session_id)
         if not old:
-            return
-        self.db.conn.execute(
-            """UPDATE sessions SET discount_percent = ?, version = version + 1,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?""",
-            (discount, session_id)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.CHANGE_DISCOUNT, "session", session_id, changed_by,
-            {"discount_percent": old.discount_percent},
-            {"discount_percent": discount},
-        )
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE sessions SET discount_percent = ? WHERE id = ?", (discount_percent, session_id))
+            self._audit(cursor, AuditAction.CHANGE_DISCOUNT, "session", session_id, changed_by,
+                        json.dumps({"discount_percent": old["discount_percent"]}),
+                        json.dumps({"discount_percent": discount_percent}))
+        return True
 
-    def update_cost_override(
-        self, session_id: int, cost: float, changed_by: str
-    ) -> None:
-        """Set fixed cost override for session."""
+    def override_cost(self, session_id: int, cost: float, changed_by: str) -> bool:
+        """Override session cost with fixed amount (PPM)."""
         old = self.get_by_id(session_id)
         if not old:
-            return
-        self.db.conn.execute(
-            """UPDATE sessions SET cost_override = ?, version = version + 1,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?""",
-            (cost, session_id)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.OVERRIDE_COST, "session", session_id, changed_by,
-            {"cost_override": old.cost_override},
-            {"cost_override": cost},
-        )
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE sessions SET override_cost = ?, cost = ? WHERE id = ?", (cost, cost, session_id))
+            self._audit(cursor, AuditAction.OVERRIDE_COST, "session", session_id, changed_by,
+                        json.dumps({"cost": old["cost"]}), json.dumps({"override_cost": cost}))
+        return True
 
-
-    def update_time_override(
-        self, session_id: int, minutes: float, changed_by: str
-    ) -> None:
-        """Set time override in minutes."""
+    def override_time(self, session_id: int, minutes: float, changed_by: str) -> bool:
+        """Override session billable time (PPM)."""
         old = self.get_by_id(session_id)
         if not old:
-            return
-        self.db.conn.execute(
-            """UPDATE sessions SET time_override_minutes = ?,
-               version = version + 1,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?""",
-            (minutes, session_id)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.OVERRIDE_TIME, "session", session_id, changed_by,
-            {"time_override_minutes": old.time_override_minutes},
-            {"time_override_minutes": minutes},
-        )
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE sessions SET override_time_minutes = ? WHERE id = ?", (minutes, session_id))
+            self._audit(cursor, AuditAction.OVERRIDE_TIME, "session", session_id, changed_by,
+                        json.dumps({"override_time_minutes": old["override_time_minutes"]}),
+                        json.dumps({"override_time_minutes": minutes}))
+        return True
 
-    def update_billing_tier(
-        self, session_id: int, tier: BillingTier, changed_by: str
-    ) -> None:
-        """Change billing tier for session."""
+    def cancel_session(self, session_id: int, changed_by: str) -> bool:
+        """Cancel a session (cost = 0, status = CANCELLED)."""
         old = self.get_by_id(session_id)
         if not old:
-            return
-        self.db.conn.execute(
-            """UPDATE sessions SET billing_tier = ?,
-               version = version + 1,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?""",
-            (tier.value, session_id)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.CHANGE_TIER, "session", session_id, changed_by,
-            {"billing_tier": old.billing_tier.value},
-            {"billing_tier": tier.value},
-        )
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE sessions SET status = ?, cost = 0 WHERE id = ?",
+                           (SessionStatus.CANCELLED.value, session_id))
+            self._audit(cursor, AuditAction.CANCEL, "session", session_id, changed_by,
+                        json.dumps({"status": old["status"], "cost": old["cost"]}),
+                        json.dumps({"status": "CANCELLED", "cost": 0}))
+        return True
 
-    def update_rate_override(
-        self, session_id: int, rate: float, changed_by: str
-    ) -> None:
-        """Set rate override PLN/h for session."""
+    def exclude_from_billing(self, session_id: int, excluded: bool, changed_by: str) -> bool:
+        """Toggle exclude from billing flag."""
         old = self.get_by_id(session_id)
         if not old:
-            return
-        self.db.conn.execute(
-            """UPDATE sessions SET rate_override = ?,
-               version = version + 1,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?""",
-            (rate, session_id)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.CHANGE_RATE, "session", session_id, changed_by,
-            {"rate_override": old.rate_override},
-            {"rate_override": rate},
-        )
-
-    def cancel_session(self, session_id: int, changed_by: str) -> None:
-        """Cancel session (GLP: not deleted, just marked)."""
-        old = self.get_by_id(session_id)
-        if not old:
-            return
-        self.db.conn.execute(
-            """UPDATE sessions SET cancelled = 1,
-               status = 'CANCELLED', version = version + 1,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?""",
-            (session_id,)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.CANCEL, "session", session_id, changed_by,
-            {"cancelled": False, "status": old.status.value},
-            {"cancelled": True, "status": "CANCELLED"},
-        )
-
-    def toggle_exclude_invoice(
-        self, session_id: int, changed_by: str
-    ) -> None:
-        """Toggle excluded_from_invoice flag."""
-        old = self.get_by_id(session_id)
-        if not old:
-            return
-        new_val = 0 if old.excluded_from_invoice else 1
-        self.db.conn.execute(
-            """UPDATE sessions SET excluded_from_invoice = ?,
-               version = version + 1,
-               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?""",
-            (new_val, session_id)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.EXCLUDE_INVOICE, "session", session_id, changed_by,
-            {"excluded_from_invoice": old.excluded_from_invoice},
-            {"excluded_from_invoice": bool(new_val)},
-        )
-
-    def _row_to_session(self, row) -> Session:
-        """Convert DB row to Session dataclass."""
-        return Session(
-            id=row["id"],
-            microscope_id=row["microscope_id"],
-            microscope_type=MicroscopeType(row["microscope_type"]),
-            username=row["username"],
-            start_time=datetime.fromisoformat(row["start_time"]) if row["start_time"] else None,
-            end_time=datetime.fromisoformat(row["end_time"]) if row["end_time"] else None,
-            duration_seconds=row["duration_seconds"] or 0.0,
-            status=SessionStatus(row["status"]),
-            billing_tier=BillingTier(row["billing_tier"]) if row["billing_tier"] else BillingTier.PROJECT,
-            hourly_rate=row["hourly_rate"] or 150.0,
-            rate_override=row["rate_override"],
-            discount_percent=row["discount_percent"] or 0.0,
-            calculated_cost=row["calculated_cost"] or 0.0,
-            cost_override=row["cost_override"],
-            time_override_minutes=row["time_override_minutes"],
-            excluded_from_invoice=bool(row["excluded_from_invoice"]),
-            cancelled=bool(row["cancelled"]),
-            hv_on_time=datetime.fromisoformat(row["hv_on_time"]) if row["hv_on_time"] else None,
-            hv_off_time=datetime.fromisoformat(row["hv_off_time"]) if row["hv_off_time"] else None,
-            gvl_open_time=datetime.fromisoformat(row["gvl_open_time"]) if row["gvl_open_time"] else None,
-            gvl_close_time=datetime.fromisoformat(row["gvl_close_time"]) if row["gvl_close_time"] else None,
-            notes=row["notes"],
-            source_file=row["source_file"] or "",
-            version=row["version"] or 1,
-        )
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE sessions SET excluded_from_billing = ? WHERE id = ?",
+                           (1 if excluded else 0, session_id))
+            self._audit(cursor, AuditAction.EXCLUDE_BILLING, "session", session_id, changed_by,
+                        json.dumps({"excluded": bool(old["excluded_from_billing"])}),
+                        json.dumps({"excluded": excluded}))
+        return True
 
 
+class VacuumRepository(BaseRepository):
+    """Repository for vacuum cycle data."""
 
-class VacuumRepository:
-    """Repository for VacuumCycle and Penalty entities."""
-
-    def __init__(self, db_manager):
-        self.db = db_manager
-
-    def get_cycles(
-        self, microscope_id: Optional[int] = None,
-        username: Optional[str] = None,
-        status: Optional[VacuumStatus] = None,
-        limit: int = 500,
-    ) -> List[VacuumCycle]:
-        """Get vacuum cycles with filters."""
-        query = "SELECT * FROM vacuum_cycles WHERE 1=1"
+    def get_all(self, session_id: Optional[int] = None) -> List[dict]:
+        """Get vacuum cycles, optionally filtered by session."""
+        query = "SELECT * FROM vacuum_cycles"
         params = []
-        if microscope_id:
-            query += " AND microscope_id = ?"
-            params.append(microscope_id)
-        if username:
-            query += " AND username = ?"
-            params.append(username)
-        if status:
-            query += " AND status = ?"
-            params.append(status.value)
-        query += " ORDER BY start_time DESC LIMIT ?"
+        if session_id is not None:
+            query += " WHERE session_id = ?"
+            params.append(session_id)
+        query += " ORDER BY pump_start DESC"
+        with self.db.get_cursor() as cursor:
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_by_source_file(self, source_file: str) -> List[dict]:
+        """Get vacuum cycles from a specific source file."""
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM vacuum_cycles WHERE source_file = ? ORDER BY pump_start", (source_file,))
+            return [dict(row) for row in cursor.fetchall()]
+
+
+class UserRepository(BaseRepository):
+    """Repository for user management."""
+
+    def get_all(self) -> List[dict]:
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM users ORDER BY username")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_by_username(self, username: str) -> Optional[dict]:
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def create(self, username: str, display_name: str, changed_by: str) -> int:
+        with self.db.get_cursor() as cursor:
+            cursor.execute("INSERT INTO users (username, display_name) VALUES (?, ?)", (username, display_name))
+            uid = cursor.lastrowid
+            self._audit(cursor, AuditAction.ADD_USER, "user", uid, changed_by, "",
+                        json.dumps({"username": username, "display_name": display_name}))
+            return uid
+
+    def update_discount(self, username: str, discount_percent: float, changed_by: str) -> bool:
+        old = self.get_by_username(username)
+        if not old:
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE users SET discount_percent = ? WHERE username = ?", (discount_percent, username))
+            self._audit(cursor, AuditAction.EDIT_USER, "user", old["id"], changed_by,
+                        json.dumps({"discount_percent": old["discount_percent"]}),
+                        json.dumps({"discount_percent": discount_percent}))
+        return True
+
+    def set_excluded(self, username: str, excluded: bool, changed_by: str) -> bool:
+        old = self.get_by_username(username)
+        if not old:
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE users SET excluded_from_billing = ? WHERE username = ?",
+                           (1 if excluded else 0, username))
+            self._audit(cursor, AuditAction.EDIT_USER, "user", old["id"], changed_by,
+                        json.dumps({"excluded": bool(old["excluded_from_billing"])}),
+                        json.dumps({"excluded": excluded}))
+        return True
+
+
+class HVRepository(BaseRepository):
+    """Repository for HV sample data."""
+
+    def get_samples(self, start_time=None, end_time=None, downsample: int = 1) -> List[dict]:
+        """Get HV samples with optional time range and downsampling."""
+        query = "SELECT * FROM hv_samples WHERE 1=1"
+        params = []
+        if start_time:
+            query += " AND timestamp >= ?"
+            params.append(start_time)
+        if end_time:
+            query += " AND timestamp <= ?"
+            params.append(end_time)
+        if downsample > 1:
+            query += f" AND (rowid % {downsample}) = 0"
+        query += " ORDER BY timestamp"
+        with self.db.get_cursor() as cursor:
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_sample_count(self, start_time=None, end_time=None) -> int:
+        """Count HV samples in a time range."""
+        query = "SELECT COUNT(*) as cnt FROM hv_samples WHERE 1=1"
+        params = []
+        if start_time:
+            query += " AND timestamp >= ?"
+            params.append(start_time)
+        if end_time:
+            query += " AND timestamp <= ?"
+            params.append(end_time)
+        with self.db.get_cursor() as cursor:
+            cursor.execute(query, params)
+            return cursor.fetchone()["cnt"]
+
+
+class AuditRepository(BaseRepository):
+    """Repository for audit log entries."""
+
+    def get_all(self, limit: int = 200, entity_type: Optional[str] = None) -> List[dict]:
+        query = "SELECT * FROM audit_log WHERE 1=1"
+        params = []
+        if entity_type:
+            query += " AND entity_type = ?"
+            params.append(entity_type)
+        query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
+        with self.db.get_cursor() as cursor:
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
 
-        rows = self.db.conn.execute(query, params).fetchall()
-        return [self._row_to_cycle(r) for r in rows]
 
-    def get_penalties(
-        self, username: Optional[str] = None, limit: int = 100
-    ) -> List[Penalty]:
-        """Get penalties with optional username filter."""
+class FileRepository(BaseRepository):
+    """Repository for imported file records."""
+
+    def get_all(self) -> List[dict]:
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM file_cache ORDER BY import_date DESC")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_by_id(self, file_id: int) -> Optional[dict]:
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM file_cache WHERE id = ?", (file_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_related_counts(self, file_path: str) -> Dict[str, int]:
+        """Get counts of related records for a file."""
+        counts = {}
+        tables = ["sessions", "vacuum_cycles", "hv_samples", "anomalies", "penalties"]
+        with self.db.get_cursor() as cursor:
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) as cnt FROM {table} WHERE source_file = ?", (file_path,))
+                counts[table] = cursor.fetchone()["cnt"]
+        return counts
+
+
+class SettingsRepository(BaseRepository):
+    """Repository for application settings."""
+
+    def get(self, key: str, default: str = "") -> str:
+        return self.db.get_setting(key, default)
+
+    def set(self, key: str, value: str, changed_by: str = "system") -> None:
+        old_value = self.get(key)
+        self.db.set_setting(key, value)
+        if old_value != value:
+            with self.db.get_cursor() as cursor:
+                self._audit(cursor, AuditAction.CHANGE_SETTING, "setting", None, changed_by,
+                            json.dumps({"key": key, "value": old_value}),
+                            json.dumps({"key": key, "value": value}))
+
+    def get_all_settings(self) -> Dict[str, str]:
+        with self.db.get_cursor() as cursor:
+            cursor.execute("SELECT key, value FROM settings")
+            return {row["key"]: row["value"] for row in cursor.fetchall()}
+
+
+class PenaltyRepository(BaseRepository):
+    """Repository for penalties."""
+
+    def get_all(self, username=None, source_file=None) -> List[dict]:
         query = "SELECT * FROM penalties WHERE 1=1"
         params = []
         if username:
             query += " AND username = ?"
             params.append(username)
-        query += " ORDER BY timestamp DESC LIMIT ?"
-        params.append(limit)
-
-        rows = self.db.conn.execute(query, params).fetchall()
-        return [self._row_to_penalty(r) for r in rows]
-
-    def _row_to_cycle(self, row) -> VacuumCycle:
-        return VacuumCycle(
-            id=row["id"],
-            microscope_id=row["microscope_id"],
-            session_id=row["session_id"],
-            username=row["username"],
-            command=row["command"],
-            start_time=datetime.fromisoformat(row["start_time"]) if row["start_time"] else None,
-            end_time=datetime.fromisoformat(row["end_time"]) if row["end_time"] else None,
-            duration_seconds=row["duration_seconds"] or 0.0,
-            status=VacuumStatus(row["status"]),
-            ready_time_seconds=row["ready_time_seconds"],
-            source_file=row["source_file"] or "",
-        )
-
-    def _row_to_penalty(self, row) -> Penalty:
-        return Penalty(
-            id=row["id"],
-            vacuum_cycle_id=row["vacuum_cycle_id"],
-            microscope_id=row["microscope_id"],
-            username=row["username"],
-            amount=row["amount"],
-            reason=row["reason"],
-            timestamp=datetime.fromisoformat(row["timestamp"]) if row["timestamp"] else None,
-            paid=bool(row["paid"]),
-            notes=row["notes"],
-        )
+        if source_file:
+            query += " AND source_file = ?"
+            params.append(source_file)
+        query += " ORDER BY timestamp DESC"
+        with self.db.get_cursor() as cursor:
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
 
 
+class AnomalyRepository(BaseRepository):
+    """Repository for anomalies."""
 
-class UserRepository:
-    """Repository for User entities."""
-
-    def __init__(self, db_manager, audit_repo: AuditRepository):
-        self.db = db_manager
-        self.audit = audit_repo
-
-    def get_all(self, active_only: bool = True) -> List[User]:
-        """Get all users."""
-        query = "SELECT * FROM users"
-        if active_only:
-            query += " WHERE active = 1"
-        query += " ORDER BY username"
-        rows = self.db.conn.execute(query).fetchall()
-        return [self._row_to_user(r) for r in rows]
-
-    def get_by_username(self, username: str) -> Optional[User]:
-        """Get user by username."""
-        row = self.db.conn.execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
-        ).fetchone()
-        return self._row_to_user(row) if row else None
-
-    def create(self, user: User, changed_by: str) -> int:
-        """Create new user. Returns user ID."""
-        cursor = self.db.conn.execute(
-            """INSERT INTO users
-               (username, display_name, role, discount_percent,
-                excluded_from_billing, pin_hash, email, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (user.username, user.display_name, user.role.value,
-             user.discount_percent, int(user.excluded_from_billing),
-             user.pin_hash, user.email, user.notes)
-        )
-        self.db.conn.commit()
-        user_id = cursor.lastrowid
-        self.audit.log_action(
-            AuditAction.CREATE, "user", user_id, changed_by,
-            new_value={"username": user.username, "role": user.role.value}
-        )
-        return user_id
-
-    def get_or_create(self, username: str, changed_by: str = "system") -> User:
-        """Get user or auto-create with default settings."""
-        user = self.get_by_username(username)
-        if user:
-            return user
-        new_user = User(username=username, display_name=username)
-        new_user.id = self.create(new_user, changed_by)
-        return new_user
-
-    def _row_to_user(self, row) -> User:
-        return User(
-            id=row["id"],
-            username=row["username"],
-            display_name=row["display_name"] or "",
-            role=UserRole(row["role"]),
-            discount_percent=row["discount_percent"] or 0.0,
-            excluded_from_billing=bool(row["excluded_from_billing"]),
-            pin_hash=row["pin_hash"],
-            email=row["email"],
-            notes=row["notes"],
-            active=bool(row["active"]),
-        )
-
-
-class MicroscopeRepository:
-    """Repository for Microscope entities (type is immutable)."""
-
-    def __init__(self, db_manager, audit_repo: AuditRepository):
-        self.db = db_manager
-        self.audit = audit_repo
-
-    def get_all(self, active_only: bool = True) -> List[Microscope]:
-        """Get all microscopes."""
-        query = "SELECT * FROM microscopes"
-        if active_only:
-            query += " WHERE active = 1"
-        rows = self.db.conn.execute(query).fetchall()
-        return [self._row_to_microscope(r) for r in rows]
-
-    def get_by_id(self, microscope_id: int) -> Optional[Microscope]:
-        """Get microscope by ID."""
-        row = self.db.conn.execute(
-            "SELECT * FROM microscopes WHERE id = ?", (microscope_id,)
-        ).fetchone()
-        return self._row_to_microscope(row) if row else None
-
-    def create(
-        self, name: str, serial_number: str,
-        microscope_type: MicroscopeType, changed_by: str,
-        location: str = ""
-    ) -> int:
-        """Register new microscope with default billing tiers."""
-        cursor = self.db.conn.execute(
-            """INSERT INTO microscopes (name, serial_number, microscope_type, location)
-               VALUES (?, ?, ?, ?)""",
-            (name, serial_number, microscope_type.value, location)
-        )
-        microscope_id = cursor.lastrowid
-
-        # Create default billing tiers
-        default_rate = 225.0 if microscope_type == MicroscopeType.MIRA3_FEG else 150.0
-        for tier in BillingTier:
-            self.db.conn.execute(
-                """INSERT INTO billing_tiers (microscope_id, tier_name, rate_pln_per_hour)
-                   VALUES (?, ?, ?)""",
-                (microscope_id, tier.value, default_rate)
-            )
-        self.db.conn.commit()
-
-        self.audit.log_action(
-            AuditAction.CREATE, "microscope", microscope_id, changed_by,
-            new_value={
-                "name": name, "serial_number": serial_number,
-                "type": microscope_type.value
-            }
-        )
-        return microscope_id
-
-    def get_tier_rates(self, microscope_id: int) -> List[BillingTierConfig]:
-        """Get all billing tier rates for a microscope."""
-        rows = self.db.conn.execute(
-            "SELECT * FROM billing_tiers WHERE microscope_id = ?",
-            (microscope_id,)
-        ).fetchall()
-        return [
-            BillingTierConfig(
-                id=r["id"],
-                microscope_id=r["microscope_id"],
-                tier=BillingTier(r["tier_name"]),
-                rate_pln_per_hour=r["rate_pln_per_hour"],
-            )
-            for r in rows
-        ]
-
-    def update_tier_rate(
-        self, microscope_id: int, tier: BillingTier,
-        rate: float, changed_by: str
-    ) -> None:
-        """Update billing tier rate for microscope."""
-        old_row = self.db.conn.execute(
-            """SELECT rate_pln_per_hour FROM billing_tiers
-               WHERE microscope_id = ? AND tier_name = ?""",
-            (microscope_id, tier.value)
-        ).fetchone()
-        old_rate = old_row["rate_pln_per_hour"] if old_row else None
-
-        self.db.conn.execute(
-            """INSERT OR REPLACE INTO billing_tiers
-               (microscope_id, tier_name, rate_pln_per_hour)
-               VALUES (?, ?, ?)""",
-            (microscope_id, tier.value, rate)
-        )
-        self.db.conn.commit()
-        self.audit.log_action(
-            AuditAction.SETTINGS_CHANGE, "billing_tier",
-            microscope_id, changed_by,
-            {"tier": tier.value, "rate": old_rate},
-            {"tier": tier.value, "rate": rate},
-        )
-
-    def _row_to_microscope(self, row) -> Microscope:
-        return Microscope(
-            id=row["id"],
-            name=row["name"],
-            serial_number=row["serial_number"],
-            microscope_type=MicroscopeType(row["microscope_type"]),
-            location=row["location"] or "",
-            notes=row["notes"],
-            active=bool(row["active"]),
-        )
+    def get_all(self, anomaly_type=None, severity=None) -> List[dict]:
+        query = "SELECT * FROM anomalies WHERE 1=1"
+        params = []
+        if anomaly_type:
+            query += " AND anomaly_type = ?"
+            params.append(anomaly_type)
+        if severity:
+            query += " AND severity = ?"
+            params.append(severity)
+        query += " ORDER BY timestamp DESC"
+        with self.db.get_cursor() as cursor:
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]

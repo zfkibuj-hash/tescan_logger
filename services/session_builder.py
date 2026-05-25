@@ -1,37 +1,29 @@
-"""Session builder - converts parsed events into Session objects.
+"""Session builder - converts parsed events into sessions.
 
-Implements business rules:
-- VEGA3: work time = HV ON -> HV OFF
-- MIRA3 FEG: work time = GVL open -> GVL close
-- No manual split (hardware guarantee)
-- Cross-month continuity (PARTIAL_SESSION + INCOMPLETE_CONTEXT matching)
+CRITICAL RULES:
+- GVL open -> GVL close = billable time (NOT HV ON/OFF!)
+- Multiple GVL cycles per session are SUMMED
+- Session without any GVL open = NO_MEASUREMENT status
+- Session without session_finished = PARTIAL status
 """
 
 import logging
-from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from datetime import datetime
+from typing import List, Optional
 
-from models.enums import EventType, SessionStatus, MicroscopeType
-from models.dataclasses import ParsedEvent, Session
+from models.enums import EventType, SessionStatus
+from models.dataclasses import ParsedEvent, Session, GVLCycle
 
 logger = logging.getLogger(__name__)
 
-# Maximum gap between end of one file and start of next for continuity matching
-CONTINUITY_GAP_SECONDS = 300  # 5 minutes
-
 
 class SessionBuilder:
-    """Builds Session objects from parsed History log events.
+    """Builds sessions from a list of parsed events."""
 
-    Business rules:
-    - Each HV ON/OFF (VEGA3) or GVL open/close (MIRA3) belongs to exactly one user
-    - Sessions cannot span user boundaries (hardware guarantee)
-    - Cross-month files are linked via PARTIAL_SESSION + INCOMPLETE_CONTEXT
-    """
-
-    def __init__(self, microscope_type: MicroscopeType, microscope_id: int = 0):
-        self.microscope_type = microscope_type
-        self.microscope_id = microscope_id
+    def __init__(self):
+        self._current_session: Optional[Session] = None
+        self._current_gvl_open: Optional[datetime] = None
+        self._sessions: List[Session] = []
 
     def build_sessions(
         self, events: List[ParsedEvent], source_file: str = ""
@@ -39,282 +31,175 @@ class SessionBuilder:
         """Build sessions from a list of parsed events.
 
         Args:
-            events: Chronologically sorted ParsedEvent list from one file.
-            source_file: Source filename for reference.
+            events: List of parsed events sorted by timestamp.
+            source_file: Source file path for tracking.
 
         Returns:
-            List of Session objects with proper status assignment.
+            List of built sessions.
         """
-        if not events:
-            return []
+        self._sessions = []
+        self._current_session = None
+        self._current_gvl_open = None
 
-        if self.microscope_type == MicroscopeType.VEGA3:
-            return self._build_vega3_sessions(events, source_file)
+        for event in events:
+            self._process_event(event, source_file)
+
+        # Handle unclosed session at end of file
+        if self._current_session is not None:
+            self._finalize_partial_session(source_file)
+
+        logger.info(
+            "Built %d sessions from %s",
+            len(self._sessions), source_file,
+        )
+        return self._sessions
+
+    def _process_event(self, event: ParsedEvent, source_file: str) -> None:
+        """Process a single event in the context of session building."""
+        if event.event_type == EventType.SESSION_START:
+            self._handle_session_start(event, source_file)
+        elif event.event_type == EventType.SESSION_FINISH:
+            self._handle_session_finish(event, source_file)
+        elif event.event_type == EventType.GVL_OPEN:
+            self._handle_gvl_open(event)
+        elif event.event_type == EventType.GVL_CLOSE:
+            self._handle_gvl_close(event)
+
+    def _handle_session_start(
+        self, event: ParsedEvent, source_file: str
+    ) -> None:
+        """Handle session start event."""
+        # If there's an unclosed session, finalize it as partial
+        if self._current_session is not None:
+            self._finalize_partial_session(source_file)
+
+        username = event.details if event.details else "unknown"
+        self._current_session = Session(
+            username=username,
+            start_time=event.timestamp,
+            source_file=source_file,
+            gvl_cycles=[],
+        )
+        self._current_gvl_open = None
+        logger.debug("Session started for %s at %s", username, event.timestamp)
+
+    def _handle_session_finish(
+        self, event: ParsedEvent, source_file: str
+    ) -> None:
+        """Handle session finish event."""
+        if self._current_session is None:
+            logger.warning(
+                "Session finish without start at %s", event.timestamp
+            )
+            return
+
+        # Close any open GVL cycle (hardware guarantee, but handle gracefully)
+        if self._current_gvl_open is not None:
+            self._close_gvl_cycle(event.timestamp)
+
+        session = self._current_session
+        session.end_time = event.timestamp
+        session.source_file = source_file
+
+        # Calculate total duration
+        if session.start_time and session.end_time:
+            delta = session.end_time - session.start_time
+            session.duration_seconds = delta.total_seconds()
+
+        # Sum GVL cycles for billable time
+        session.gvl_total_seconds = sum(
+            c.duration_seconds for c in session.gvl_cycles
+        )
+
+        # Determine status
+        if len(session.gvl_cycles) == 0:
+            session.status = SessionStatus.NO_MEASUREMENT
         else:
-            return self._build_mira3_sessions(events, source_file)
+            session.status = SessionStatus.COMPLETE
 
-    def _build_vega3_sessions(
-        self, events: List[ParsedEvent], source_file: str
-    ) -> List[Session]:
-        """Build sessions for VEGA3 (HV ON -> HV OFF = work time)."""
-        sessions = []
-        current_user: Optional[str] = None
-        session_start: Optional[datetime] = None
-        hv_on: Optional[datetime] = None
-        hv_off: Optional[datetime] = None
+        self._sessions.append(session)
+        self._current_session = None
+        self._current_gvl_open = None
 
-        # Check if file starts mid-session (INCOMPLETE_CONTEXT)
-        first_relevant = self._find_first_relevant_event(events)
-        if first_relevant and first_relevant.event_type in (EventType.HV_OFF, EventType.SESSION_END):
-            # File starts in the middle of a session
-            session = Session(
-                microscope_id=self.microscope_id,
-                microscope_type=self.microscope_type,
-                username="UNKNOWN",
-                end_time=first_relevant.timestamp,
-                status=SessionStatus.INCOMPLETE_CONTEXT,
-                source_file=source_file,
+        logger.debug(
+            "Session finished: %s, GVL total: %.1fs, cycles: %d",
+            session.username,
+            session.gvl_total_seconds,
+            len(session.gvl_cycles),
+        )
+
+    def _handle_gvl_open(self, event: ParsedEvent) -> None:
+        """Handle GVL open event - start of billable time."""
+        if self._current_session is None:
+            logger.warning("GVL open outside session at %s", event.timestamp)
+            return
+
+        if self._current_gvl_open is not None:
+            # GVL already open - unusual but don't double-count
+            logger.warning(
+                "GVL open while already open at %s", event.timestamp
             )
-            if first_relevant.event_type == EventType.HV_OFF:
-                session.hv_off_time = first_relevant.timestamp
-            sessions.append(session)
+            return
 
-        for event in events:
-            if event.event_type == EventType.SESSION_START:
-                current_user = event.username
-                session_start = event.timestamp
+        self._current_gvl_open = event.timestamp
+        logger.debug("GVL open at %s", event.timestamp)
 
-            elif event.event_type == EventType.HV_ON:
-                hv_on = event.timestamp
+    def _handle_gvl_close(self, event: ParsedEvent) -> None:
+        """Handle GVL close event - end of billable time."""
+        if self._current_session is None:
+            logger.warning("GVL close outside session at %s", event.timestamp)
+            return
 
-            elif event.event_type == EventType.HV_OFF:
-                if hv_on is not None:
-                    hv_off = event.timestamp
-                    duration = (hv_off - hv_on).total_seconds()
-
-                    session = Session(
-                        microscope_id=self.microscope_id,
-                        microscope_type=self.microscope_type,
-                        username=current_user or "UNKNOWN",
-                        start_time=session_start or hv_on,
-                        end_time=hv_off,
-                        duration_seconds=duration,
-                        status=SessionStatus.COMPLETE,
-                        hv_on_time=hv_on,
-                        hv_off_time=hv_off,
-                        source_file=source_file,
-                    )
-                    sessions.append(session)
-                    hv_on = None
-                    hv_off = None
-
-            elif event.event_type == EventType.SESSION_END:
-                # If HV was on without OFF, this shouldn't happen (hardware guarantee)
-                # but handle gracefully
-                if hv_on is not None:
-                    logger.warning(
-                        "Session ended with HV still ON at %s (should not happen)",
-                        event.timestamp
-                    )
-                session_start = None
-                current_user = None
-
-        # Check for PARTIAL_SESSION (HV on at end of file)
-        if hv_on is not None:
-            session = Session(
-                microscope_id=self.microscope_id,
-                microscope_type=self.microscope_type,
-                username=current_user or "UNKNOWN",
-                start_time=session_start or hv_on,
-                hv_on_time=hv_on,
-                status=SessionStatus.PARTIAL_SESSION,
-                source_file=source_file,
+        if self._current_gvl_open is None:
+            logger.warning(
+                "GVL close without open at %s", event.timestamp
             )
-            sessions.append(session)
+            return
 
-        return sessions
+        self._close_gvl_cycle(event.timestamp)
 
-    def _build_mira3_sessions(
-        self, events: List[ParsedEvent], source_file: str
-    ) -> List[Session]:
-        """Build sessions for MIRA3 FEG (GVL open -> GVL close = work time)."""
-        sessions = []
-        current_user: Optional[str] = None
-        session_start: Optional[datetime] = None
-        gvl_open: Optional[datetime] = None
-        gvl_close: Optional[datetime] = None
+    def _close_gvl_cycle(self, close_time: datetime) -> None:
+        """Close the current GVL cycle and add it to the session."""
+        if self._current_gvl_open is None or self._current_session is None:
+            return
 
-        # Check if file starts mid-session (INCOMPLETE_CONTEXT)
-        first_relevant = self._find_first_relevant_event_mira3(events)
-        if first_relevant and first_relevant.event_type in (EventType.GVL_CLOSE, EventType.SESSION_END):
-            session = Session(
-                microscope_id=self.microscope_id,
-                microscope_type=self.microscope_type,
-                username="UNKNOWN",
-                end_time=first_relevant.timestamp,
-                status=SessionStatus.INCOMPLETE_CONTEXT,
-                source_file=source_file,
-            )
-            if first_relevant.event_type == EventType.GVL_CLOSE:
-                session.gvl_close_time = first_relevant.timestamp
-            sessions.append(session)
+        cycle = GVLCycle(
+            open_time=self._current_gvl_open,
+            close_time=close_time,
+        )
+        self._current_session.gvl_cycles.append(cycle)
+        self._current_gvl_open = None
 
-        for event in events:
-            if event.event_type == EventType.SESSION_START:
-                current_user = event.username
-                session_start = event.timestamp
+        logger.debug(
+            "GVL cycle closed: %.1f seconds", cycle.duration_seconds
+        )
 
-            elif event.event_type == EventType.GVL_OPEN:
-                gvl_open = event.timestamp
+    def _finalize_partial_session(self, source_file: str) -> None:
+        """Finalize an unclosed session as PARTIAL."""
+        if self._current_session is None:
+            return
 
-            elif event.event_type == EventType.GVL_CLOSE:
-                if gvl_open is not None:
-                    gvl_close = event.timestamp
-                    duration = (gvl_close - gvl_open).total_seconds()
+        session = self._current_session
+        session.source_file = source_file
+        session.status = SessionStatus.PARTIAL
 
-                    session = Session(
-                        microscope_id=self.microscope_id,
-                        microscope_type=self.microscope_type,
-                        username=current_user or "UNKNOWN",
-                        start_time=session_start or gvl_open,
-                        end_time=gvl_close,
-                        duration_seconds=duration,
-                        status=SessionStatus.COMPLETE,
-                        gvl_open_time=gvl_open,
-                        gvl_close_time=gvl_close,
-                        source_file=source_file,
-                    )
-                    sessions.append(session)
-                    gvl_open = None
-                    gvl_close = None
+        # Close any open GVL cycle using last known time
+        # (not ideal but better than losing data)
+        if self._current_gvl_open is not None:
+            # Leave it unclosed - partial data
+            self._current_gvl_open = None
 
-            elif event.event_type == EventType.SESSION_END:
-                session_start = None
-                current_user = None
+        # Sum whatever GVL cycles we have
+        session.gvl_total_seconds = sum(
+            c.duration_seconds for c in session.gvl_cycles
+        )
 
-        # PARTIAL_SESSION: GVL open at end of file
-        if gvl_open is not None:
-            session = Session(
-                microscope_id=self.microscope_id,
-                microscope_type=self.microscope_type,
-                username=current_user or "UNKNOWN",
-                start_time=session_start or gvl_open,
-                gvl_open_time=gvl_open,
-                status=SessionStatus.PARTIAL_SESSION,
-                source_file=source_file,
-            )
-            sessions.append(session)
+        if session.start_time:
+            session.duration_seconds = 0.0  # Unknown end
 
-        return sessions
+        self._sessions.append(session)
+        self._current_session = None
 
-    def _find_first_relevant_event(self, events: List[ParsedEvent]) -> Optional[ParsedEvent]:
-        """Find first HV_OFF or SESSION_END before any HV_ON (indicates INCOMPLETE_CONTEXT)."""
-        for event in events:
-            if event.event_type == EventType.HV_ON:
-                return None  # Normal start
-            if event.event_type == EventType.SESSION_START:
-                return None  # Normal start
-            if event.event_type in (EventType.HV_OFF, EventType.SESSION_END):
-                return event
-        return None
-
-    def _find_first_relevant_event_mira3(self, events: List[ParsedEvent]) -> Optional[ParsedEvent]:
-        """Find first GVL_CLOSE or SESSION_END before any GVL_OPEN."""
-        for event in events:
-            if event.event_type == EventType.GVL_OPEN:
-                return None
-            if event.event_type == EventType.SESSION_START:
-                return None
-            if event.event_type in (EventType.GVL_CLOSE, EventType.SESSION_END):
-                return event
-        return None
-
-    @staticmethod
-    def link_cross_month_sessions(
-        sessions: List[Session],
-    ) -> List[Session]:
-        """Link PARTIAL_SESSION from one file with INCOMPLETE_CONTEXT from next.
-
-        Rules:
-        - Same username
-        - Time gap < CONTINUITY_GAP_SECONDS (5 min)
-        - Result: merged into single COMPLETE session
-
-        Args:
-            sessions: All sessions from multiple files, sorted by time.
-
-        Returns:
-            Sessions with cross-month pairs merged.
-        """
-        if len(sessions) < 2:
-            return sessions
-
-        partial_sessions = [
-            (i, s) for i, s in enumerate(sessions)
-            if s.status == SessionStatus.PARTIAL_SESSION
-        ]
-        incomplete_sessions = [
-            (i, s) for i, s in enumerate(sessions)
-            if s.status == SessionStatus.INCOMPLETE_CONTEXT
-        ]
-
-        merged_indices = set()
-
-        for p_idx, partial in partial_sessions:
-            for i_idx, incomplete in incomplete_sessions:
-                if i_idx in merged_indices:
-                    continue
-
-                # Check username match (or UNKNOWN)
-                if (partial.username != "UNKNOWN" and
-                    incomplete.username != "UNKNOWN" and
-                    partial.username != incomplete.username):
-                    continue
-
-                # Check time gap
-                partial_time = partial.hv_on_time or partial.gvl_open_time or partial.start_time
-                incomplete_time = incomplete.hv_off_time or incomplete.gvl_close_time or incomplete.end_time
-
-                if partial_time is None or incomplete_time is None:
-                    continue
-
-                gap = abs((incomplete_time - partial_time).total_seconds())
-                if gap > CONTINUITY_GAP_SECONDS:
-                    continue
-
-                # Merge: partial becomes COMPLETE with end from incomplete
-                partial.end_time = incomplete.end_time or incomplete_time
-                partial.status = SessionStatus.COMPLETE
-
-                if incomplete.hv_off_time:
-                    partial.hv_off_time = incomplete.hv_off_time
-                if incomplete.gvl_close_time:
-                    partial.gvl_close_time = incomplete.gvl_close_time
-
-                # Recalculate duration
-                start = partial.hv_on_time or partial.gvl_open_time or partial.start_time
-                end = partial.hv_off_time or partial.gvl_close_time or partial.end_time
-                if start and end:
-                    partial.duration_seconds = (end - start).total_seconds()
-
-                # Use username from whichever side has it
-                if partial.username == "UNKNOWN" and incomplete.username != "UNKNOWN":
-                    partial.username = incomplete.username
-
-                merged_indices.add(i_idx)
-                merged_indices.add(p_idx)  # Mark partial as processed
-                break
-
-        # Return sessions excluding merged INCOMPLETE_CONTEXT entries
-        result = [
-            s for i, s in enumerate(sessions)
-            if i not in merged_indices or sessions[i].status == SessionStatus.COMPLETE
-        ]
-        # Re-add merged partials (now COMPLETE)
-        for p_idx, partial in partial_sessions:
-            if p_idx in merged_indices and partial.status == SessionStatus.COMPLETE:
-                if partial not in result:
-                    result.append(partial)
-
-        result.sort(key=lambda s: s.start_time or datetime.min)
-        return result
+        logger.debug(
+            "Partial session finalized: %s", session.username
+        )
