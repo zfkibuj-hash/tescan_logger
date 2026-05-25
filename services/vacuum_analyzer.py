@@ -1,10 +1,10 @@
-"""Vacuum cycle analyzer — processes vacuum events into cycles with penalties.
+"""Vacuum cycle analyzer - processes vacuum events into cycles with penalties.
 
 Business rules:
-- PUMP → READY = OK
-- PUMP → VENT = ABORTED
-- PUMP → OFF = ABORTED
-- VENT → OFF = LEFT_VENTED → penalty 100 PLN
+- PUMP -> READY = OK
+- PUMP -> VENT = ABORTED
+- PUMP -> OFF = ABORTED
+- VENT -> OFF = LEFT_VENTED -> penalty 100 PLN
 
 Anomaly detection:
 - LONG_PUMP_TIME: ready_time exceeds threshold (possible contamination / outgassing)
@@ -77,7 +77,7 @@ class VacuumAnalyzer:
             elif event.event_type == EventType.SESSION_END:
                 current_user = None
 
-            # ANOMALY: Idle after ready — user started measurement long after vacuum ready
+            # ANOMALY: Idle after ready - user started measurement long after vacuum ready
             elif event.event_type in (EventType.HV_ON, EventType.GVL_OPEN):
                 if vacuum_ready_time is not None:
                     idle_gap = (event.timestamp - vacuum_ready_time).total_seconds()
@@ -112,7 +112,7 @@ class VacuumAnalyzer:
                 is_venting = False
 
             elif event.event_type == EventType.VACUUM_READY:
-                # PUMP → READY = OK
+                # PUMP -> READY = OK
                 if is_pumping and pump_start is not None:
                     ready_seconds = None
                     if event.details:
@@ -166,7 +166,7 @@ class VacuumAnalyzer:
 
             elif event.event_type == EventType.VACUUM_VENT:
                 if is_pumping and pump_start is not None:
-                    # PUMP → VENT = ABORTED
+                    # PUMP -> VENT = ABORTED
                     duration = (event.timestamp - pump_start).total_seconds()
                     cycle = VacuumCycle(
                         microscope_id=self.microscope_id,
@@ -189,7 +189,7 @@ class VacuumAnalyzer:
 
             elif event.event_type == EventType.VACUUM_OFF:
                 if is_pumping and pump_start is not None:
-                    # PUMP → OFF = ABORTED
+                    # PUMP -> OFF = ABORTED
                     duration = (event.timestamp - pump_start).total_seconds()
                     cycle = VacuumCycle(
                         microscope_id=self.microscope_id,
@@ -207,7 +207,7 @@ class VacuumAnalyzer:
                     pump_start = None
 
                 elif is_venting and vent_start is not None:
-                    # VENT → OFF = LEFT_VENTED → penalty!
+                    # VENT -> OFF = LEFT_VENTED -> penalty!
                     duration = (event.timestamp - vent_start).total_seconds()
                     cycle = VacuumCycle(
                         microscope_id=self.microscope_id,

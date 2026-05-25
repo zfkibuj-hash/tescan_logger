@@ -1,7 +1,7 @@
-"""Billing service — calculates costs for sessions.
+"""Billing service - calculates costs for sessions.
 
 Business rules:
-- Rate determined by: microscope type × billing tier
+- Rate determined by: microscope type x billing tier
 - Discount reduces TIME, not rate
 - Override hierarchy: cost_override > time_override + discount > raw calculation
 - Excluded from billing accounts: cost = 0
@@ -35,9 +35,9 @@ class BillingService:
     """Calculates session costs based on rates, tiers, and discounts.
 
     Cost calculation priority:
-    1. If cancelled → 0
-    2. If excluded_from_billing (user) → 0
-    3. If cost_override set → use it directly
+    1. If cancelled -> 0
+    2. If excluded_from_billing (user) -> 0
+    3. If cost_override set -> use it directly
     4. Otherwise: effective_hours × discount_factor × effective_rate
     """
 
@@ -131,7 +131,7 @@ class BillingService:
 
         Args:
             sessions: List of sessions to process.
-            users: Optional dict of username → User for discount lookup.
+            users: Optional dict of username -> User for discount lookup.
 
         Returns:
             Same list with calculated_cost updated.

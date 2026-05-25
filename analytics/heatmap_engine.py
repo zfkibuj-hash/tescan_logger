@@ -1,4 +1,4 @@
-"""Heatmap data engine — generates matrices for heatmap visualization.
+"""Heatmap data engine - generates matrices for heatmap visualization.
 
 Supports:
 - 6 heatmap types (usage, pumping, penalties, anomalies, idle, gvl)
@@ -254,7 +254,7 @@ class HeatmapEngine:
 
         rows = self.db.conn.execute(query, params).fetchall()
 
-        # Build day→hour→value mapping
+        # Build day->hour->value mapping
         data: Dict[str, Dict[int, float]] = {}
         for r in rows:
             day = r["day"]

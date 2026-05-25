@@ -1,7 +1,7 @@
-"""Import service — orchestrates the full import pipeline.
+"""Import service - orchestrates the full import pipeline.
 
-Pipeline: scan files → check cache → parse → build sessions →
-analyze vacuum → calculate costs → persist to DB.
+Pipeline: scan files -> check cache -> parse -> build sessions ->
+analyze vacuum -> calculate costs -> persist to DB.
 """
 
 import logging
@@ -43,7 +43,7 @@ class ImportService:
     Steps:
     1. Scan/filter files
     2. Check file_cache (skip already imported)
-    3. Parse History files → events
+    3. Parse History files -> events
     4. Build sessions from events
     5. Analyze vacuum cycles
     6. Calculate billing costs

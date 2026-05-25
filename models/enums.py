@@ -4,7 +4,7 @@ from enum import Enum, auto
 
 
 class MicroscopeType(Enum):
-    """Type of TESCAN microscope — immutable after registration."""
+    """Type of TESCAN microscope - immutable after registration."""
     VEGA3 = "VEGA3"
     MIRA3_FEG = "MIRA3_FEG"
 
@@ -36,14 +36,14 @@ class SessionStatus(Enum):
 
 class VacuumStatus(Enum):
     """Status of a vacuum cycle."""
-    OK = "OK"                    # PUMP → READY
-    ABORTED = "ABORTED"          # PUMP → VENT or PUMP → OFF
-    LEFT_VENTED = "LEFT_VENTED"  # VENT → OFF → penalty 100 PLN
+    OK = "OK"                    # PUMP -> READY
+    ABORTED = "ABORTED"          # PUMP -> VENT or PUMP -> OFF
+    LEFT_VENTED = "LEFT_VENTED"  # VENT -> OFF -> penalty 100 PLN
     IN_PROGRESS = "IN_PROGRESS"  # cycle not yet finished
 
 
 class BillingTier(Enum):
-    """Billing tier for a session — determines rate multiplier."""
+    """Billing tier for a session - determines rate multiplier."""
     PROJECT = "PROJECT"      # Research projects (default)
     UJ_UNIT = "UJ_UNIT"      # Jagiellonian University internal units
     EXTERNAL = "EXTERNAL"    # External entities

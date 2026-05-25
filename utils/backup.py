@@ -1,4 +1,4 @@
-"""Backup manager — rolling backups + monthly snapshots.
+"""Backup manager - rolling backups + monthly snapshots.
 
 Features:
 - Auto-backup on application startup (configurable)

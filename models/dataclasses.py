@@ -124,7 +124,7 @@ class User:
 
 @dataclass
 class Microscope:
-    """Registered microscope — type is immutable after creation."""
+    """Registered microscope - type is immutable after creation."""
     id: Optional[int] = None
     name: str = ""
     serial_number: str = ""
@@ -170,7 +170,7 @@ class Anomaly:
 
 @dataclass
 class Penalty:
-    """Penalty for LEFT_VENTED vacuum cycle — always 100 PLN."""
+    """Penalty for LEFT_VENTED vacuum cycle - always 100 PLN."""
     id: Optional[int] = None
     vacuum_cycle_id: int = 0
     microscope_id: int = 0
@@ -185,7 +185,7 @@ class Penalty:
 
 @dataclass
 class AuditEntry:
-    """Audit log entry — GLP compliant, UTC timestamps."""
+    """Audit log entry - GLP compliant, UTC timestamps."""
     id: Optional[int] = None
     action: AuditAction = AuditAction.EDIT
     entity_type: str = ""  # 'session', 'user', 'vacuum_cycle', etc.

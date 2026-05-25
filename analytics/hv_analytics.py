@@ -1,4 +1,4 @@
-"""HV analytics — emission drift, pressure spikes, diagnostics.
+"""HV analytics - emission drift, pressure spikes, diagnostics.
 
 Analyzes HV sample data to detect anomalies and generate statistics.
 """
@@ -186,7 +186,7 @@ class HVAnalytics:
                     anomaly_type=AnomalyType.EMISSION_DRIFT,
                     severity="warning" if drift_percent < 50 else "critical",
                     timestamp=samples[-1].timestamp,
-                    description=f"Emission drift: {drift_percent:.1f}% ({avg_first:.2f} → {avg_last:.2f} µA)",
+                    description=f"Emission drift: {drift_percent:.1f}% ({avg_first:.2f} -> {avg_last:.2f} µA)",
                     value=drift_percent,
                     threshold=EMISSION_DRIFT_THRESHOLD,
                     source_file=samples[0].source_file,

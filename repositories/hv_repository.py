@@ -1,4 +1,4 @@
-"""HV samples repository — accesses the separate HV database.
+"""HV samples repository - accesses the separate HV database.
 
 Provides query methods with SQL-side downsampling for performance.
 """

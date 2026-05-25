@@ -1,4 +1,4 @@
-"""TESCAN Log Analyzer — Entry point.
+"""TESCAN Log Analyzer - Entry point.
 
 Desktop application for tracking and billing TESCAN microscope usage
 based on system logs. GLP/ISO 17025 compliant.
@@ -186,7 +186,7 @@ def main():
     # Launch GUI or inform about CLI mode
     if args.no_gui:
         logger.info("CLI mode. Use --import DIR, --backup, or --verify.")
-        print(f"{APP_NAME} v{APP_VERSION} — CLI mode")
+        print(f"{APP_NAME} v{APP_VERSION} - CLI mode")
         print("Commands: --import DIR | --backup | --verify")
     else:
         launch_gui(db)

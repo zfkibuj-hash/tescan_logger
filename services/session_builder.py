@@ -1,8 +1,8 @@
-"""Session builder — converts parsed events into Session objects.
+"""Session builder - converts parsed events into Session objects.
 
 Implements business rules:
-- VEGA3: work time = HV ON → HV OFF
-- MIRA3 FEG: work time = GVL open → GVL close
+- VEGA3: work time = HV ON -> HV OFF
+- MIRA3 FEG: work time = GVL open -> GVL close
 - No manual split (hardware guarantee)
 - Cross-month continuity (PARTIAL_SESSION + INCOMPLETE_CONTEXT matching)
 """
@@ -56,7 +56,7 @@ class SessionBuilder:
     def _build_vega3_sessions(
         self, events: List[ParsedEvent], source_file: str
     ) -> List[Session]:
-        """Build sessions for VEGA3 (HV ON → HV OFF = work time)."""
+        """Build sessions for VEGA3 (HV ON -> HV OFF = work time)."""
         sessions = []
         current_user: Optional[str] = None
         session_start: Optional[datetime] = None
@@ -137,7 +137,7 @@ class SessionBuilder:
     def _build_mira3_sessions(
         self, events: List[ParsedEvent], source_file: str
     ) -> List[Session]:
-        """Build sessions for MIRA3 FEG (GVL open → GVL close = work time)."""
+        """Build sessions for MIRA3 FEG (GVL open -> GVL close = work time)."""
         sessions = []
         current_user: Optional[str] = None
         session_start: Optional[datetime] = None

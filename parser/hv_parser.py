@@ -37,8 +37,8 @@ class HVLogParser:
         """Detect HV log format by scanning first 50 data lines.
 
         Rules:
-        - 8 numeric fields + word (Open/Closed) → VEGA3
-        - 11 numeric/hex fields → MIRA3_FEG
+        - 8 numeric fields + word (Open/Closed) -> VEGA3
+        - 11 numeric/hex fields -> MIRA3_FEG
 
         Returns:
             Detected MicroscopeType.

@@ -164,8 +164,8 @@ class HistoryLogParser:
         """Auto-detect microscope type from parsed events.
 
         Rules:
-        - Presence of GVL_OPEN or GVL_CLOSE → MIRA3_FEG
-        - Presence of HV_ON without GVL events → VEGA3
+        - Presence of GVL_OPEN or GVL_CLOSE -> MIRA3_FEG
+        - Presence of HV_ON without GVL events -> VEGA3
         """
         has_gvl = any(
             e.event_type in (EventType.GVL_OPEN, EventType.GVL_CLOSE)

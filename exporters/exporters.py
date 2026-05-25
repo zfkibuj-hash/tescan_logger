@@ -1,4 +1,4 @@
-"""Export modules — Excel, PDF, CSV generation.
+"""Export modules - Excel, PDF, CSV generation.
 
 Generates billing reports, session lists, audit trail exports.
 """
