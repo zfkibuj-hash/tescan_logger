@@ -127,13 +127,21 @@ VENT -> OFF      = LEFT_VENTED -> kara 100 PLN
 
 ### Rozliczenia:
 - Flat rate: jedna stawka PLN/h (konfigurowana w Settings)
-- Rabat: zmniejsza rozliczany CZAS, nie stawke
+- Rabat procentowy: zmniejsza rozliczany CZAS, nie stawke
+- Rabat godzinowy: odejmuje konkretna liczbe godzin od rozliczenia
+  (np. bylo 12h, odejmujemy 2h, rozliczamy 10h - oryginalna wartosc zachowana)
 - Rabat per user (globalny) lub per sesja (PPM)
 - Per-sesja nadpisuje globalny
 - Override kosztu (kwota na sztywno)
 - Override czasu (minuty na sztywno)
 - `excluded_from_billing` = konto bez kosztow (vacuum nadal analizowane)
 - Kara LEFT_VENTED: 100 PLN za kazdy przypadek
+
+Priorytet kalkulacji:
+1. excluded -> 0 PLN
+2. override_cost -> uzywamy kwoty na sztywno
+3. override_time_minutes -> rate * czas_reczny
+4. gvl_total * (1 - discount%) - discount_hours*3600 = billable_seconds
 
 ### Usuwanie wczytanych plikow:
 - Mozliwosc usuniecia zaimportowanego pliku z bazy
@@ -335,7 +343,8 @@ TOTAL BILLABLE: 81 min 46s
 
 ## PPM MENU (prawy przycisk na sesji)
 
-- Ustaw rabat % (zmniejsza czas)
+- Ustaw rabat % (zmniejsza czas procentowo)
+- Odejmij godziny od rozliczenia (np. -2h z 12h = rozliczamy 10h)
 - Ustaw kwote na sztywno (PLN)
 - Ustaw czas recznie (minuty)
 - Wyklucz z faktury (toggle)

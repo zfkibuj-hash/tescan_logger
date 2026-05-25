@@ -56,6 +56,7 @@ class Session:
     status: SessionStatus = SessionStatus.COMPLETE
     cost: float = 0.0
     discount_percent: float = 0.0
+    discount_hours: float = 0.0  # hours subtracted from billable time (e.g. -2h)
     override_cost: Optional[float] = None
     override_time_minutes: Optional[float] = None
     excluded_from_billing: bool = False
@@ -64,10 +65,16 @@ class Session:
 
     @property
     def billable_seconds(self) -> float:
-        """Effective billable time after discount."""
+        """Effective billable time after all discounts.
+
+        Priority:
+        1. override_time_minutes set -> use that directly
+        2. Otherwise: gvl_total * (1 - discount%) - discount_hours*3600
+        """
         if self.override_time_minutes is not None:
             return self.override_time_minutes * 60.0
         effective = self.gvl_total_seconds * (1.0 - self.discount_percent / 100.0)
+        effective -= self.discount_hours * 3600.0
         return max(effective, 0.0)
 
 

@@ -82,6 +82,7 @@ class SessionsTab:
         self.context_menu.add_command(label="Set Discount %", command=self._set_discount)
         self.context_menu.add_command(label="Set Fixed Cost (PLN)", command=self._set_fixed_cost)
         self.context_menu.add_command(label="Set Manual Time (min)", command=self._set_manual_time)
+        self.context_menu.add_command(label="Subtract Hours from Billing", command=self._subtract_hours)
         self.context_menu.add_separator()
         self.context_menu.add_command(
             label="Exclude from Invoice (toggle)", command=self._toggle_exclude
@@ -188,6 +189,35 @@ class SessionsTab:
         self.app.session_repo.override_time(session_id, value, operator)
         self._recalculate_cost(session_id)
         self.refresh()
+
+    def _subtract_hours(self):
+        """Subtract hours from billable time (PPM).
+
+        Example: session has 12h GVL time, user subtracts 2h -> billed for 10h.
+        Preserves original measurement time, records discount_hours separately.
+        """
+        session_id = self._get_selected_session_id()
+        if session_id is None:
+            return
+        session = self.app.session_repo.get_by_id(session_id)
+        if session is None:
+            return
+        gvl_hours = session.get("gvl_total_seconds", 0) / 3600.0
+        value = simpledialog.askfloat(
+            "Subtract Hours",
+            f"Hours to subtract from billing (measured: {gvl_hours:.1f}h):",
+            minvalue=0, maxvalue=gvl_hours,
+        )
+        if value is None:
+            return
+        operator = self.app.get_operator()
+        self.app.session_repo.set_discount_hours(session_id, value, operator)
+        self._recalculate_cost(session_id)
+        self.refresh()
+        self.app.set_status(
+            f"Subtracted {value}h from session {session_id} "
+            f"(was {gvl_hours:.1f}h, billed for {gvl_hours - value:.1f}h)"
+        )
         self.app.set_status(f"Manual time {value} min set for session {session_id}")
 
     def _toggle_exclude(self):

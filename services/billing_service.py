@@ -69,10 +69,11 @@ class BillingService:
         if session.override_time_minutes is not None:
             billable_seconds = session.override_time_minutes * 60.0
         else:
-            # Apply discount to GVL total time
+            # Apply discount percent to GVL total time, then subtract discount hours
             billable_seconds = session.gvl_total_seconds * (
                 1.0 - discount_percent / 100.0
             )
+            billable_seconds -= session.discount_hours * 3600.0
 
         # Ensure non-negative
         billable_seconds = max(billable_seconds, 0.0)

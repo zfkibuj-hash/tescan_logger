@@ -89,6 +89,22 @@ class SessionRepository(BaseRepository):
                         json.dumps({"override_time_minutes": minutes}))
         return True
 
+    def set_discount_hours(self, session_id: int, hours: float, changed_by: str) -> bool:
+        """Set discount hours - subtracted from billable time (PPM).
+
+        Example: session has 12h GVL, discount_hours=2 -> billed for 10h.
+        Original measurement time is preserved, discount tracked separately.
+        """
+        old = self.get_by_id(session_id)
+        if not old:
+            return False
+        with self.db.get_cursor() as cursor:
+            cursor.execute("UPDATE sessions SET discount_hours = ? WHERE id = ?", (hours, session_id))
+            self._audit(cursor, AuditAction.EDIT, "session", session_id, changed_by,
+                        json.dumps({"discount_hours": old.get("discount_hours", 0)}),
+                        json.dumps({"discount_hours": hours}))
+        return True
+
     def cancel_session(self, session_id: int, changed_by: str) -> bool:
         """Cancel a session (cost = 0, status = CANCELLED)."""
         old = self.get_by_id(session_id)

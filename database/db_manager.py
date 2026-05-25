@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT DEFAULT 'COMPLETE',
     cost REAL DEFAULT 0.0,
     discount_percent REAL DEFAULT 0.0,
+    discount_hours REAL DEFAULT 0.0,
     override_cost REAL,
     override_time_minutes REAL,
     excluded_from_billing INTEGER DEFAULT 0,
