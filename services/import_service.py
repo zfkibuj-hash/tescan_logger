@@ -117,7 +117,7 @@ class ImportService:
         sessions = builder.build_sessions(events, file_path)
 
         # Analyze vacuum
-        cycles, penalties = self.vacuum_analyzer.analyze(events, file_path)
+        cycles, penalties, anomalies = self.vacuum_analyzer.analyze(events, file_path)
 
         # Calculate costs
         self.billing_service.calculate_batch(sessions)

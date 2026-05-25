@@ -105,4 +105,5 @@ class AnomalyType(Enum):
     VACUUM_DEGRADATION = "vacuum_degradation"
     HV_INSTABILITY = "hv_instability"
     LONG_PUMP_TIME = "long_pump_time"
+    IDLE_AFTER_READY = "idle_after_ready"
     HV_LOG_GAP = "hv_log_gap"
