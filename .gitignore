@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-wal
+*.db-shm
+dist/
+build/
+*.spec
+venv/
+.venv/
+exports/
+backups/
+logs/
+cache/
+*.egg-info/

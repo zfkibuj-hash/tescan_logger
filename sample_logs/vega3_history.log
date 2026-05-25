@@ -1,0 +1,27 @@
+2026-05-01 08:00:01.123 [I] == Starting software ==
+2026-05-01 08:05:12.456 [I] == Session started for user: kowalski ==
+2026-05-01 08:05:45.789 [I] Vacuum: command PUMP, chamber
+2026-05-01 08:08:30.012 [I] Vacuum: Vacuum: ready in 165 s, chamber pressure 3.2e-003 Pa
+2026-05-01 08:10:00.345 [I] HV: HV has been turned ON
+2026-05-01 09:45:22.678 [I] HV: HV has been turned OFF
+2026-05-01 09:45:23.901 [I] HV: HV heating has been turned OFF
+2026-05-01 09:50:00.234 [I] Vacuum: command VENT, chamber
+2026-05-01 09:55:00.567 [I] == Session finished ==
+2026-05-01 10:00:05.890 [I] == Session started for user: nowak ==
+2026-05-01 10:00:30.123 [I] Vacuum: command PUMP, chamber
+2026-05-01 10:02:45.456 [I] Vacuum: Vacuum: ready in 135 s, chamber pressure 2.8e-003 Pa
+2026-05-01 10:05:00.789 [I] HV: HV has been turned ON
+2026-05-01 11:30:15.012 [I] HV: HV has been turned OFF
+2026-05-01 11:30:16.345 [I] HV: HV heating has been turned OFF
+2026-05-01 11:35:00.678 [I] Vacuum: command VENT, chamber
+2026-05-01 11:40:00.901 [I] Vacuum: command OFF
+2026-05-01 11:45:00.234 [I] == Session finished ==
+2026-05-01 14:00:02.567 [I] == Session started for user: wisniewski ==
+2026-05-01 14:00:30.890 [I] Vacuum: command PUMP, chamber
+2026-05-01 14:03:10.123 [I] Vacuum: Vacuum: ready in 160 s, chamber pressure 3.5e-003 Pa
+2026-05-01 14:05:00.456 [I] HV: HV has been turned ON
+2026-05-01 15:20:00.789 [I] HV: HV has been turned OFF
+2026-05-01 15:20:01.012 [I] HV: HV heating has been turned OFF
+2026-05-01 15:25:00.345 [I] Vacuum: command VENT, chamber
+2026-05-01 15:30:00.678 [I] == Session finished ==
+2026-05-01 15:35:00.901 [I] == Terminating software ==

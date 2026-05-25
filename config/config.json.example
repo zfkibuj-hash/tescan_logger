@@ -1,0 +1,30 @@
+{
+    "database": {
+        "main_db": "tescan_logger.db",
+        "hv_db": "tescan_hv.db"
+    },
+    "backup": {
+        "auto_on_startup": true,
+        "retention_days": 30,
+        "backup_dir": "backups"
+    },
+    "import": {
+        "default_directory": "",
+        "history_pattern": "History-\\d{4}-\\d{2}\\.log$",
+        "hv_pattern": "hv[-_].*\\d{4}-\\d{2}.*\\.log$"
+    },
+    "billing": {
+        "default_tier": "PROJECT",
+        "penalty_amount_pln": 100.0
+    },
+    "glp": {
+        "require_pin": false,
+        "data_retention_years": 5
+    },
+    "heatmap_colors": [
+        {"value": 0.0, "color": "#FFFFFF"},
+        {"value": 0.01, "color": "#00FF00"},
+        {"value": 0.5, "color": "#FFFF00"},
+        {"value": 1.0, "color": "#FF0000"}
+    ]
+}
