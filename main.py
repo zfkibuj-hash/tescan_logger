@@ -141,10 +141,8 @@ def do_verify(db: DatabaseManager) -> None:
 def start_gui(db: DatabaseManager) -> None:
     """Start the GUI application."""
     try:
-        # GUI module imports tkinter - only import when needed
-        print("Starting TESCAN VEGA3 Log Analyzer GUI...")
-        print("(GUI module not included in backend-only build)")
-        print("Use --import, --backup, or --verify for CLI operations.")
+        from gui.main_window import launch_gui
+        launch_gui(db)
     except ImportError as e:
         print(f"GUI startup failed: {e}")
         print("Run with --no-gui for CLI mode.")
